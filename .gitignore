@@ -1,0 +1,7 @@
+/coco2017/
+/Talk2Car/
+annotations_trainval2017.zip
+train2017.zip
+/test_result
+*/__pycache__/
+/results/

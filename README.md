@@ -1,7 +1,7 @@
 # 💡 2단계 지식 증류를 통한 경량 Talk2Car 멀티모달 모델 개발
 
 ## 프로젝트 소개
-본 프로젝트는 자율주행 환경에서 필수적인 **속도**와 **가벼움**을 확보하기 위해, 대형 OpenCLIP 교사 모델의 지식을 **경량 ConvNeXt-Tiny** 학생 모델로 이전하는 **2단계 지식 증류(Knowledge Distillation)** 방법론을 제안하고 구현합니다[cite: 2, 3, 12, 19].
+본 프로젝트는 자율주행 환경에서 필수적인 **속도**와 **가벼움**을 확보하기 위해, 대형 OpenCLIP 교사 모델의 지식을 **경량 ConvNeXt-Tiny** 학생 모델로 이전하는 **2단계 지식 증류(Knowledge Distillation)** 방법론을 제안하고 구현합니다.
 
 ### 핵심 목표
 1.  **1단계 (Distillation):** ConvNeXt-Tiny 모델을 대규모 COCO 데이터셋을 활용하여 OpenCLIP-Base 모델의 CLIP 멀티모달 공간에 안정적으로 정렬합니다.
