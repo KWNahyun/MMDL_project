@@ -1,0 +1,71 @@
+# config/default.yaml
+
+# ==================================
+# 1. 경로 설정
+# ==================================
+ROOT_DIR: "./"
+COCO_DIR_NAME: "coco2017"
+TEACHER_WEIGHTS_PATH: "openclip_complete.pth"
+STUDENT_WEIGHTS_PATH: "distilled_weights.pth" # 1단계 완료 후 저장될 경로
+FINAL_WEIGHTS_PATH: "talk2car_final.pth"      # 2단계 완료 후 저장될 경로
+
+DATA_URLS:
+  IMAGES_ZIP: "http://images.cocodataset.org/zips/train2017.zip"
+  ANN_ZIP: "http://images.cocodataset.org/annotations/annotations_trainval2017.zip"
+
+# ==================================
+# 2. 모델 설정
+# ==================================
+TEACHER_MODEL: "convnext_base_w"
+TEACHER_PRETRAIN: "laion2b_s13b_b82k"
+STUDENT_MODEL_BACKBONE: "convnext_tiny"
+IMAGE_SIZE: 224
+
+# ==================================
+# 3. 데이터셋 설정 (Stage 1)
+# ==================================
+TARGET_CLASS_NAMES: ["person", "car", "truck", "bus", "motorcycle", "bicycle", "traffic light", "stop sign"]
+MIN_AREA_RATIO: 0.0004
+SMALL_ONLY: False
+MAX_IMAGES_TRAINING: 50000 
+MAX_IMAGES_EVAL: 1000
+
+# ==================================
+# 4. Stage 1: Distillation 훈련 설정
+# ==================================
+TRAIN:
+  NUM_EPOCHS: 5
+  BATCH_SIZE: 16
+  LEARNING_RATE: 1.0e-4
+  WEIGHT_DECAY: 1.0e-4
+  TEMPERATURE: 0.07
+  NUM_WORKERS: 2
+  LOSS_WEIGHTS: # 복합 Loss 가중치
+    w_clip: 1.0
+    w_sim: 1.0
+    w_cos: 1.0
+
+# ==================================
+# 5. Stage 1 평가 설정
+# ==================================
+EVAL:
+  TOP_K: 10
+  MAX_BANK_BATCHES: 200
+
+# ==================================
+# 6. Stage 2: Talk2Car 설정
+# ==================================
+TALK2CAR:
+  DIR_NAME: "./Talk2Car/data" 
+  # ANNOTATION_FILE: "Talk2Car_bbox.json"
+  
+  # Cross-modal Head 구조
+  # HEAD_TYPE: "Transformer" 
+  HEAD_TYPE: "Projection" 
+  
+  # 2단계 훈련 하이퍼파라미터
+  FINE_TUNE:
+    NUM_EPOCHS: 20
+    BATCH_SIZE: 16
+    LEARNING_RATE: 1.0e-5 # 파인튜닝은 낮은 LR 사용
+    NUM_WORKERS: 2
