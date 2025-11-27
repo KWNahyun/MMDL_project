@@ -126,3 +126,75 @@ class DistillationLosses(nn.Module):
                   (weights.get('w_sim', 0.0) * L_sim)
                   
         return L_total, L_clip, L_cos, L_sim
+    
+
+
+class Talk2CarLoss(nn.Module):
+    """
+    Stage 2 Fine-tuning을 위한 Loss.
+    L1 Loss (좌표 거리) + GIoU Loss (박스 겹침 및 형태 최적화)
+    """
+    def __init__(self):
+        super().__init__()
+
+    def box_cxcywh_to_xyxy(self, x):
+        """[x, y, w, h] -> [x1, y1, x2, y2] 변환"""
+        x_c, y_c, w, h = x.unbind(-1)
+        # 데이터셋이 [top_left_x, top_left_y, w, h] 형태이므로:
+        b = [(x_c), (y_c), (x_c + w), (y_c + h)]
+        return torch.stack(b, dim=-1)
+
+    def generalized_box_iou(self, boxes1, boxes2):
+        """
+        GIoU 계산 (Generalized Intersection over Union)
+        boxes: [N, 4] (x1, y1, x2, y2) format
+        """
+        # 1. Intersection Area
+        # boxes1과 boxes2의 교집합 좌표 계산
+        # boxes1은 예측값, boxes2는 정답값 (둘 다 [N, 4])
+        lt = torch.max(boxes1[:, :2], boxes2[:, :2]) # [N, 2] left-top
+        rb = torch.min(boxes1[:, 2:], boxes2[:, 2:]) # [N, 2] right-bottom
+        wh = (rb - lt).clamp(min=0) # [N, 2] width, height
+        inter = wh[:, 0] * wh[:, 1] # [N] intersection area
+
+        # 2. Union Area
+        area1 = (boxes1[:, 2] - boxes1[:, 0]) * (boxes1[:, 3] - boxes1[:, 1])
+        area2 = (boxes2[:, 2] - boxes2[:, 0]) * (boxes2[:, 3] - boxes2[:, 1])
+        union = area1 + area2 - inter
+
+        # 3. IoU
+        iou = inter / (union + 1e-6)
+
+        # 4. Enclosing Box (C) Area
+        # 두 박스를 모두 포함하는 가장 작은 박스 좌표
+        lt_c = torch.min(boxes1[:, :2], boxes2[:, :2])
+        rb_c = torch.max(boxes1[:, 2:], boxes2[:, 2:])
+        wh_c = (rb_c - lt_c).clamp(min=0)
+        area_c = wh_c[:, 0] * wh_c[:, 1]
+
+        # 5. GIoU
+        giou = iou - ((area_c - union) / (area_c + 1e-6))
+        return giou
+
+    def forward(self, pred_bbox, gt_bbox, weights):
+        """
+        Args:
+            pred_bbox: [B, 4] (x, y, w, h) normalized
+            gt_bbox:   [B, 4] (x, y, w, h) normalized
+            weights:   {'w_l1': float, 'w_giou': float}
+        """
+        # 1. L1 Loss (직접 좌표 회귀)
+        loss_l1 = F.l1_loss(pred_bbox, gt_bbox, reduction='mean')
+
+        # 2. GIoU Loss
+        # GIoU 계산을 위해 xywh -> xyxy 변환
+        pred_xyxy = self.box_cxcywh_to_xyxy(pred_bbox)
+        gt_xyxy = self.box_cxcywh_to_xyxy(gt_bbox)
+        
+        giou = self.generalized_box_iou(pred_xyxy, gt_xyxy)
+        loss_giou = 1.0 - giou.mean() # GIoU는 높을수록 좋으므로 1 - GIoU를 최소화
+
+        # 3. Weighted Sum
+        loss_total = (weights['w_l1'] * loss_l1) + (weights['w_giou'] * loss_giou)
+        
+        return loss_total, loss_l1, loss_giou

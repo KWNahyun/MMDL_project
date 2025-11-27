@@ -60,12 +60,17 @@ TALK2CAR:
   # ANNOTATION_FILE: "Talk2Car_bbox.json"
   
   # Cross-modal Head 구조
-  # HEAD_TYPE: "Transformer" 
-  HEAD_TYPE: "Projection" 
+  HEAD_TYPE: "Transformer" 
+  # HEAD_TYPE: "Projection" 
   
   # 2단계 훈련 하이퍼파라미터
   FINE_TUNE:
-    NUM_EPOCHS: 20
+    NUM_EPOCHS: 50
     BATCH_SIZE: 16
     LEARNING_RATE: 1.0e-5 # 파인튜닝은 낮은 LR 사용
     NUM_WORKERS: 2
+
+    # Loss 가중치 설정 (L1 + GIoU)
+    LOSS_WEIGHTS:
+      w_l1: 5.0
+      w_giou: 2.0
