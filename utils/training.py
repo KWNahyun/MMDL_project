@@ -129,11 +129,12 @@ def fine_tune_epoch(model, loss_fn, optimizer, loader, tokenizer, teacher_model,
 
 def evaluate_talk2car(model, loader, tokenizer, teacher_model, device, cfg):
     """
-    Talk2Car 데이터셋에 대해 모델을 평가하고 평균 IoU를 계산합니다.
+    Talk2Car 데이터셋에 대해 모델을 평가하고 평균 IoU 및 AP50을 계산합니다.
     """
     model.eval()
     total_iou = 0
-    count = 0
+    total_correct_05 = 0 # AP50 (IoU >= 0.5) 측정을 위한 카운터
+    total_samples = 0
     
     print("\n--- Evaluating Talk2Car ---")
     with torch.no_grad():
@@ -174,14 +175,21 @@ def evaluate_talk2car(model, loader, tokenizer, teacher_model, device, cfg):
             gt_area = gt_bboxes[:, 2] * gt_bboxes[:, 3]
             union_area = pred_area + gt_area - inter_area
             
-            # IoU
+            # IoU 벡터 계산
             iou = inter_area / (union_area + 1e-6)
-            total_iou += iou.mean().item()
-            count += 1
             
-    avg_iou = total_iou / count if count > 0 else 0
+            # 통계 누적
+            total_iou += iou.sum().item()
+            total_correct_05 += (iou >= 0.5).sum().item()
+            total_samples += images.size(0)
+            
+    avg_iou = total_iou / total_samples if total_samples > 0 else 0
+    ap50 = (total_correct_05 / total_samples) * 100 if total_samples > 0 else 0
+    
     print(f"Average IoU: {avg_iou:.4f}")
-    return avg_iou
+    print(f"AP50 (IoU >= 0.5): {ap50:.2f}%") # 리더보드 비교용 지표
+    
+    return avg_iou, ap50
 
 # ==============================================================================
 # Stage 1 Evaluation Utilities
