@@ -21,6 +21,9 @@ from utils.training import (
 )
 from utils.evaluation import detailed_talk2car_analysis
 
+import warnings
+warnings.filterwarnings('ignore')
+
 # === Logging Helper ===
 class Logger(object):
     """콘솔 출력을 파일과 터미널에 동시 출력"""

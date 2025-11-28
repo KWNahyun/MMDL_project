@@ -22,7 +22,9 @@ STUDENT_MODEL_BACKBONE: "convnext_tiny"  # or "convnext_tiny_multiscale"
 STUDENT_WEIGHTS_PATH: "results/latest/distilled_weights.pth"
 
 # 이미지 설정
-IMAGE_SIZE: 224
+# IMAGE_SIZE: 224
+# IMAGE_SIZE: 384  
+IMAGE_SIZE: 512
 
 # Stage 1: COCO Distillation 설정
 MAX_IMAGES_TRAINING: null  # null이면 전체 사용
@@ -41,6 +43,13 @@ TARGET_CLASS_NAMES:
   - "truck"
   - "traffic light"
   - "stop sign"
+
+# Stage 0: Teacher Domain Adaptation (NEW)
+TEACHER_ADAPTATION:
+  ENABLED: true
+  NUM_EPOCHS: 1
+  LEARNING_RATE: 5e-6
+  BATCH_SIZE: 32
 
 # Stage 1 학습 하이퍼파라미터
 TRAIN:
@@ -93,9 +102,3 @@ TALK2CAR:
     USE_FOCAL: false
     FOCAL_GAMMA: 2.0
 
-# Stage 0: Teacher Domain Adaptation (NEW)
-TEACHER_ADAPTATION:
-  ENABLED: true
-  NUM_EPOCHS: 1
-  LEARNING_RATE: 5e-6
-  BATCH_SIZE: 32

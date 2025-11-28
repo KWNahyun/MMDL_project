@@ -1,4 +1,3 @@
-# models/student_model.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -9,91 +8,96 @@ from models.grounding_head import ProjectionGroundingHead, TransformerGroundingH
 class DistilledConvNeXtTiny(nn.Module):
     """
     기본 Student 모델 (Single-Scale)
-    Stage 1: Global Feature 출력
-    Stage 2: Spatial Feature 제공
+    - Stage 1: Global Feature 출력 (Contrastive Learning용)
+    - Stage 2: Spatial Feature 출력 (Grounding용, No Pooling)
     """
     def __init__(self, text_dim, backbone_name="convnext_tiny"):
         super().__init__()
-        # Spatial Feature 유지
+        # [핵심 1] global_pool='' 설정으로 Pooling을 비활성화하여 (B, C, H, W) 맵 유지
         self.backbone = timm.create_model(backbone_name, pretrained=True, num_classes=0, global_pool='')
         
-        # Stage 1 Distillation용 Global Head
+        # Stage 1 Distillation을 위한 Global Pooling 및 Head
         self.pool = nn.AdaptiveAvgPool2d(1)
         self.head = nn.Linear(self.backbone.num_features, text_dim)
 
     def forward(self, x):
         """Stage 1: Distillation용 (Global Feature)"""
         feat_map = self.backbone(x)  # [B, C, H, W]
+        
+        # [핵심 2] Stage 1에서는 Crop된 Region 이미지가 들어오므로, 
+        # 이를 Global Pooling 해도 결과적으로는 "Local Region Feature"가 됨.
         pooled = self.pool(feat_map).flatten(1)  # [B, C]
         emb = self.head(pooled)
         return emb
+    
+    def get_spatial_features(self, x):
+        """Stage 2: Grounding용 (Spatial Feature)"""
+        # Pooling 없이 (B, C, H, W) 맵을 그대로 반환 -> Transformer Head가 좌표를 찾음
+        return self.backbone(x)
 
 
 class DistilledConvNeXtTinyMultiScale(nn.Module):
     """
-    Multi-Scale Student 모델 (팀원 코드 반영)
-    - Stage 2, 3, 4를 모두 추출하여 Concat
-    - 다양한 크기의 객체 특징 포착
+    Multi-Scale Student 모델
+    - 작은 객체와 큰 객체를 모두 잘 잡기 위해 여러 계층의 Feature를 융합
+    - ConvNeXt의 Stage 2, 3, 4 출력을 결합
     """
     def __init__(self, text_dim, backbone_name="convnext_tiny"):
         super().__init__()
-        # Stage 2, 3, 4 추출 (features_only=True)
+        # features_only=True: 중간 레이어의 Feature Map들을 리스트로 반환
         self.backbone = timm.create_model(
             backbone_name, 
             pretrained=True, 
             features_only=True, 
-            out_indices=(1, 2, 3)  # Stage 2, 3, 4
+            out_indices=(1, 2, 3)  # Stage 2(1/8), 3(1/16), 4(1/32) 추출
         )
         
-        # Feature 차원: Stage2=192, Stage3=384, Stage4=768 → Total=1344
+        # Feature 차원 융합 (1x1 Conv)
+        # Stage 2(192) + Stage 3(384) + Stage 4(768) = 1344 채널
+        # 이를 256 채널로 압축하여 Transformer 입력으로 사용
         self.fusion = nn.Sequential(
             nn.Conv2d(1344, 256, kernel_size=1),
             nn.BatchNorm2d(256),
             nn.ReLU(inplace=True)
         )
         
-        # Stage 1 Distillation용 Global Head
+        # Stage 1용 Head
         self.pool = nn.AdaptiveAvgPool2d(1)
         self.head = nn.Linear(256, text_dim)
         
-        # Feature 차원 저장
         self.num_features = 256
+
+    def _get_fused_features(self, x):
+        """Feature 추출 및 Multi-scale Fusion 공통 로직"""
+        # c2: 1/8 scale, c3: 1/16 scale, c4: 1/32 scale
+        c2, c3, c4 = self.backbone(x)
+        h, w = c2.shape[-2:] # 가장 큰 해상도(c2) 기준
+        
+        # Upsampling하여 크기 맞춤 (Interpolation)
+        c3 = F.interpolate(c3, size=(h, w), mode='bilinear', align_corners=False)
+        c4 = F.interpolate(c4, size=(h, w), mode='bilinear', align_corners=False)
+        
+        # 채널 방향으로 결합 (Concat)
+        concat_feat = torch.cat([c2, c3, c4], dim=1) # [B, 1344, H, W]
+        
+        # 채널 압축 (Fusion)
+        fused_feat = self.fusion(concat_feat) # [B, 256, H, W]
+        return fused_feat
 
     def forward(self, x):
         """Stage 1: Distillation용 (Global Feature)"""
-        c2, c3, c4 = self.backbone(x)
-        h, w = c2.shape[-2:]
-        
-        # 모든 스케일을 Stage2 크기로 맞춤
-        c3 = F.interpolate(c3, size=(h, w), mode='bilinear', align_corners=False)
-        c4 = F.interpolate(c4, size=(h, w), mode='bilinear', align_corners=False)
-        
-        # Concatenate & Fuse
-        fused = self.fusion(torch.cat([c2, c3, c4], dim=1))  # [B, 256, H, W]
-        
-        # Global Pooling
-        pooled = self.pool(fused).flatten(1)  # [B, 256]
+        fused = self._get_fused_features(x) # [B, 256, H, W]
+        pooled = self.pool(fused).flatten(1) # [B, 256]
         return self.head(pooled)
     
     def get_spatial_features(self, x):
-        """
-        Stage 2: Grounding용 (Spatial Feature 유지)
-        Talk2CarModel에서 호출
-        """
-        c2, c3, c4 = self.backbone(x)
-        h, w = c2.shape[-2:]
-        
-        c3 = F.interpolate(c3, size=(h, w), mode='bilinear', align_corners=False)
-        c4 = F.interpolate(c4, size=(h, w), mode='bilinear', align_corners=False)
-        
-        return self.fusion(torch.cat([c2, c3, c4], dim=1))  # [B, 256, H, W]
+        """Stage 2: Grounding용 (Spatial Feature) - No Pooling"""
+        return self._get_fused_features(x) # [B, 256, H, W] 그대로 반환
 
 
 class Talk2CarModel(nn.Module):
     """
     Stage 2 파인튜닝 통합 모델
-    - Distilled Encoder + Grounding Head
-    - Config에 따라 Head Type 선택 (Projection / Transformer)
     """
     def __init__(self, distilled_encoder, text_dim, head_type):
         super().__init__()
@@ -109,7 +113,7 @@ class Talk2CarModel(nn.Module):
         self.head_type = head_type
         print(f"[Model] Initializing Talk2CarModel with Head Type: {head_type}")
 
-        # Grounding Head 선택
+        # [핵심 3] Cross-Attention 기반 Transformer Head 사용 권장
         if head_type == "Transformer":
             self.grounding_head = TransformerGroundingHead(
                 image_feat_dim=encoder_feat_dim,
@@ -128,22 +132,19 @@ class Talk2CarModel(nn.Module):
             
     def forward(self, images, text_emb):
         """
-        Forward Pass
         Args:
             images: [B, 3, H, W]
             text_emb: [B, text_dim]
-        Returns:
-            pred_bbox: [B, 4] (normalized x, y, w, h)
         """
-        # 1. Image Feature 추출
-        # Multi-Scale 모델이면 get_spatial_features 사용
+        # 1. Image Feature 추출 (Spatial Feature: [B, C, H, W])
+        # get_spatial_features 메서드가 있으면 사용 (Multi-Scale 등)
         if hasattr(self.image_encoder, 'get_spatial_features'):
             image_feat = self.image_encoder.get_spatial_features(images)
         else:
-            # 기본 모델은 backbone 직접 호출
+            # 기본 모델 (get_spatial_features를 위에서 구현했으므로 실제론 여기 안 탐)
             image_feat = self.image_encoder.backbone(images)
         
-        # 2. Grounding Head 통과
+        # 2. Grounding Head 통과 (Cross-Attention 수행)
         pred_bbox = self.grounding_head(image_feat, text_emb)
         
         return pred_bbox
@@ -152,7 +153,6 @@ class Talk2CarModel(nn.Module):
 def load_student_encoder(path, text_dim, backbone_name, device):
     """
     Student Encoder 로드
-    - backbone_name에 따라 Single-Scale / Multi-Scale 선택
     """
     # Multi-Scale 옵션 확인
     if "multiscale" in backbone_name.lower():
@@ -166,17 +166,23 @@ def load_student_encoder(path, text_dim, backbone_name, device):
     # 가중치 로드
     if path and os.path.exists(path):
         print(f"[Model] Loading student weights from: {path}")
-        ckpt = torch.load(path, map_location="cpu")
-        if "state_dict" in ckpt:
-            ckpt = ckpt["state_dict"]
-        
-        # Strict=False로 로드 (Head 크기 불일치 허용)
-        missing, unexpected = model.load_state_dict(ckpt, strict=False)
-        if missing:
-            print(f"[Warning] Missing keys: {missing}")
-        if unexpected:
-            print(f"[Warning] Unexpected keys: {unexpected}")
+        try:
+            ckpt = torch.load(path, map_location="cpu")
+            if "state_dict" in ckpt:
+                ckpt = ckpt["state_dict"]
+            
+            # Strict=False로 로드 (Multi-Scale 구조 변경이나 Head 차이 대응)
+            missing, unexpected = model.load_state_dict(ckpt, strict=False)
+            
+            if missing:
+                # print(f"[Info] Missing keys: {missing}")
+                pass
+        except Exception as e:
+            print(f"[Error] Failed to load weights: {e}")
+            print("[Model] Fallback to ImageNet pretrained weights.")
     else:
-        print(f"[Model] No checkpoint found at '{path}'. Using ImageNet pretrained backbone.")
+        if path:
+            print(f"[Warning] Checkpoint not found at '{path}'.")
+        print("[Model] Initializing with ImageNet pretrained weights (No Distillation).")
         
     return model.to(device)
