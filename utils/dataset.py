@@ -12,12 +12,50 @@ CLIP_MEAN = [0.48145466, 0.4578275, 0.40821073]
 CLIP_STD  = [0.26862954, 0.26130258, 0.27577711]
 
 def get_clip_transform(image_size):
-    """CLIP 표준 이미지 변환을 정의합니다."""
+    """기본 CLIP 변환"""
     return T.Compose([
         T.Resize((image_size, image_size)),
         T.ToTensor(),
         T.Normalize(CLIP_MEAN, CLIP_STD),
     ])
+
+def get_augmented_transform(image_size, cfg):
+    """
+    Albumentations 기반 강력한 증강 (Stage 1용)
+    팀원 코드 스타일 반영
+    """
+    aug_cfg = cfg.get('AUGMENTATION', {})
+    
+    if not aug_cfg.get('USE_ALBUMENTATIONS', False):
+        return get_clip_transform(image_size)
+    
+    try:
+        import albumentations as A
+        from albumentations.pytorch import ToTensorV2
+        
+        return A.Compose([
+            A.Resize(image_size, image_size),
+            A.HorizontalFlip(p=aug_cfg.get('HORIZONTAL_FLIP', 0.5)),
+            A.OneOf([
+                A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=1),
+                A.HueSaturationValue(hue_shift_limit=20, sat_shift_limit=30, val_shift_limit=20, p=1),
+            ], p=aug_cfg.get('COLOR_JITTER', 0.5)),
+            A.ShiftScaleRotate(
+                shift_limit=aug_cfg.get('SHIFT_SCALE', 0.05),
+                scale_limit=aug_cfg.get('SHIFT_SCALE', 0.05),
+                rotate_limit=aug_cfg.get('ROTATION', 5),
+                p=0.3
+            ),
+            A.OneOf([
+                A.GaussNoise(var_limit=(5.0, 20.0), p=1),
+                A.GaussianBlur(blur_limit=(3, 5), p=1),
+            ], p=aug_cfg.get('NOISE_BLUR', 0.3)),
+            A.Normalize(mean=CLIP_MEAN, std=CLIP_STD),
+            ToTensorV2()
+        ])
+    except ImportError:
+        print("[Warning] Albumentations not installed. Using basic transform.")
+        return get_clip_transform(image_size)
 
 class COCORegionTextDataset(Dataset):
     def __init__(self, coco_dir, cfg, split="train2017", ann="instances_train2017.json", transform=None, max_images=None):
@@ -48,7 +86,6 @@ class COCORegionTextDataset(Dataset):
 
         if self.target_class_names:
             target_ids = self.coco.getCatIds(catNms=list(self.target_class_names))
-            # 관련 클래스가 있는 이미지만 필터링
             filtered = []
             for img_id in img_ids:
                 ann_ids = self.coco.getAnnIds(imgIds=[img_id], catIds=target_ids)
@@ -97,13 +134,13 @@ class COCORegionTextDataset(Dataset):
             area = (x2-x1)*(y2-y1)
             area_ratio = area/(W*H)
 
-            # 크기 필터링 로직
+            # 크기 필터링
             if self.small_only and area_ratio > 0.03: continue
             if not self.small_only and area_ratio < self.min_area_ratio: continue
 
             crop = img.crop((x1,y1,x2,y2))
 
-            # 크기에 따른 텍스트 생성
+            # 크기별 텍스트
             if area_ratio < 0.005: size = "a very small"
             elif area_ratio < 0.02: size = "a small"
             elif area_ratio < 0.08: size = "a medium"
@@ -111,7 +148,7 @@ class COCORegionTextDataset(Dataset):
 
             text = f"{size} {cat}"
 
-            # 이미지 변환
+            # 변환
             crop = crop.resize((self.image_size, self.image_size))
             t_img = self.transform(crop) if self.transform else T.ToTensor()(crop)
 
@@ -120,7 +157,7 @@ class COCORegionTextDataset(Dataset):
         return {"image_path": str(path), "regions": regions}
 
 def collate_fn(batch):
-    """배치 내의 모든 영역과 텍스트를 병합합니다."""
+    """배치 병합"""
     imgs,texts=[],[]
     for b in batch:
         for r in b["regions"]:

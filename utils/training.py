@@ -1,3 +1,4 @@
+# utils/training.py
 import torch
 import torch.nn.functional as F
 import open_clip
@@ -6,36 +7,153 @@ from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
 from utils.visualization import save_visualization
 from pathlib import Path
+import json
 
 # ==============================================================================
 # Helper Functions
 # ==============================================================================
 
 def encode_text(text_list, tokenizer, teacher_model, device):
-    """Teacher Text Encoder를 사용하여 텍스트 임베딩을 계산합니다 (Frozen)."""
+    """Teacher Text Encoder (Frozen)"""
     with torch.no_grad():
         tok = tokenizer(text_list, context_length=77).to(device)
         return teacher_model.encode_text(tok)
 
 def encode_image_teacher(images, teacher_model):
-    """Teacher Image Encoder를 사용하여 이미지 임베딩을 계산합니다 (Frozen)."""
+    """Teacher Image Encoder (Frozen)"""
     with torch.no_grad():
         return teacher_model.encode_image(images)
 
 # ==============================================================================
-# Stage 1: Knowledge Distillation (Alignment)
+# Stage 0: Teacher Domain Adaptation (NEW)
+# ==============================================================================
+
+def adapt_teacher_to_talk2car(teacher_model, tokenizer, t2c_dir, device, cfg):
+    """
+    Stage 0: Teacher를 Talk2Car 도메인에 적응
+    - Talk2Car 이미지-명령어 쌍으로 Contrastive Learning
+    - Visual Encoder만 학습
+    """
+    from torch.utils.data import Dataset, DataLoader
+    from PIL import Image
+    import torch.optim as optim
+    
+    print("\n=== Stage 0: Teacher Domain Adaptation ===")
+    
+    # Visual Encoder만 학습
+    for name, param in teacher_model.named_parameters():
+        if "visual" not in name:
+            param.requires_grad = False
+        else:
+            param.requires_grad = True
+    
+    # Talk2Car Caption Dataset
+    class Talk2CarCaptionDataset(Dataset):
+        def __init__(self, data_dir, split, transform):
+            self.data_dir = Path(data_dir)
+            self.transform = transform
+            
+            json_file = self.data_dir / "commands" / f"{split}_commands.json"
+            with open(json_file, 'r') as f:
+                content = json.load(f)
+            
+            self.samples = []
+            img_dir = self.data_dir / "images"
+            
+            for item in content["commands"]:
+                img_path = img_dir / item['t2c_img']
+                if img_path.exists():
+                    self.samples.append((img_path, item['command']))
+            
+            print(f"   Loaded {len(self.samples)} samples for adaptation")
+        
+        def __len__(self):
+            return len(self.samples)
+        
+        def __getitem__(self, idx):
+            img_path, command = self.samples[idx]
+            try:
+                img = Image.open(img_path).convert('RGB')
+                return self.transform(img), command
+            except:
+                # Fallback
+                return self.transform(Image.new('RGB', (224, 224))), command
+    
+    # Transform (OpenCLIP 표준)
+    _, _, preprocess = open_clip.create_model_and_transforms(
+        cfg['TEACHER_MODEL'], pretrained=None
+    )
+    
+    # Dataset & Loader
+    train_ds = Talk2CarCaptionDataset(t2c_dir, 'train', preprocess)
+    
+    # KITTI 스타일 오버샘플링은 Talk2Car에선 불필요 (충분히 큼)
+    loader = DataLoader(train_ds, 
+                       batch_size=cfg['TEACHER_ADAPTATION']['BATCH_SIZE'], 
+                       shuffle=True, num_workers=4)
+    
+    # Optimizer
+    optimizer = optim.AdamW(
+        filter(lambda p: p.requires_grad, teacher_model.parameters()),
+        lr=float(cfg['TEACHER_ADAPTATION']['LEARNING_RATE'])
+    )
+    
+    # Training Loop
+    teacher_model.train()
+    num_epochs = cfg['TEACHER_ADAPTATION']['NUM_EPOCHS']
+    
+    for epoch in range(num_epochs):
+        total_loss = 0
+        pbar = tqdm(loader, desc=f"Teacher Adaptation Ep{epoch+1}/{num_epochs}")
+        
+        for imgs, texts in pbar:
+            imgs = imgs.to(device)
+            text_tokens = tokenizer(texts).to(device)
+            
+            # CLIP Contrastive Loss
+            img_features = teacher_model.encode_image(imgs)
+            text_features = teacher_model.encode_text(text_tokens)
+            
+            img_features = F.normalize(img_features, dim=-1)
+            text_features = F.normalize(text_features, dim=-1)
+            
+            logit_scale = teacher_model.logit_scale.exp()
+            logits_per_image = logit_scale * img_features @ text_features.T
+            logits_per_text = logits_per_image.T
+            
+            labels = torch.arange(len(imgs), device=device)
+            loss = (F.cross_entropy(logits_per_image, labels) +
+                   F.cross_entropy(logits_per_text, labels)) / 2
+            
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item()
+            pbar.set_postfix({'loss': f"{loss.item():.4f}"})
+        
+        avg_loss = total_loss / len(loader)
+        print(f"   Epoch {epoch+1} Avg Loss: {avg_loss:.4f}")
+    
+    # Freeze again
+    for param in teacher_model.parameters():
+        param.requires_grad = False
+    
+    teacher_model.eval()
+    print("✅ Teacher adaptation completed")
+    
+    return teacher_model
+
+# ==============================================================================
+# Stage 1: Knowledge Distillation
 # ==============================================================================
 
 def train_epoch(student_encoder, clip_loss_fn, optimizer, loader, tokenizer, teacher_model, device, cfg, epoch):
-    """
-    1단계 지식 증류를 위한 단일 훈련 에포크를 실행합니다.
-    InfoNCE, Similarity-KD, Post-Cosine Loss를 복합적으로 사용합니다.
-    """
+    """Stage 1 훈련 에포크"""
     student_encoder.train()
     clip_loss_fn.train()
     s, acc = 0, 0
     
-    # Config에서 가중치 가져오기
     weights = cfg['TRAIN']['LOSS_WEIGHTS']
     
     print(f"\n--- [Stage 1] Epoch {epoch} (Weights: {weights}) ---")
@@ -46,22 +164,20 @@ def train_epoch(student_encoder, clip_loss_fn, optimizer, loader, tokenizer, tea
         images, texts = bt
         images = images.to(device)
 
-        # 1. Teacher Outputs (Frozen)
+        # Teacher Outputs (Frozen)
         txt_emb_teacher = encode_text(texts, tokenizer, teacher_model, device)
         img_emb_teacher = encode_image_teacher(images, teacher_model)
         
-        # 2. Student Output (Trainable)
+        # Student Output
         img_emb_student = student_encoder(images)
 
-        # 3. Teacher Logits (for SimKD)
-        # Teacher의 Image-Text 관계(Logit)를 계산하여 Student가 이를 모사하도록 함
+        # Teacher Logits
         with torch.no_grad():
             t_img_norm = F.normalize(img_emb_teacher, dim=-1)
             t_txt_norm = F.normalize(txt_emb_teacher, dim=-1)
             logits_teacher = t_img_norm @ t_txt_norm.t()
 
-        # 4. Complex Loss Calculation
-        # (InfoNCE + SimKD + PostCosine)
+        # Loss
         L_total, L_clip, L_cos, L_sim = clip_loss_fn(
             img_emb_student=img_emb_student,
             txt_emb_teacher=txt_emb_teacher,
@@ -82,41 +198,35 @@ def train_epoch(student_encoder, clip_loss_fn, optimizer, loader, tokenizer, tea
     return acc / s if s > 0 else 0
 
 # ==============================================================================
-# Stage 2: Talk2Car Fine-tuning (Grounding)
+# Stage 2: Talk2Car Fine-tuning
 # ==============================================================================
 
 def fine_tune_epoch(model, loss_fn, optimizer, loader, tokenizer, teacher_model, device, epoch, cfg):
-    """
-    2단계 Talk2Car 파인튜닝을 위한 단일 훈련 에포크를 실행합니다.
-    L1 Loss (좌표 거리) + GIoU Loss (박스 겹침 최적화)를 사용합니다.
-    """
+    """Stage 2 훈련 에포크"""
     model.train()
     loss_fn.train() 
     s, acc = 0, 0
     
-    # Config에서 가중치 가져오기
     weights = cfg['TALK2CAR']['FINE_TUNE']['LOSS_WEIGHTS']
     
     print(f"\n--- [Stage 2] Fine-tuning Epoch {epoch} (L1:{weights['w_l1']}, GIoU:{weights['w_giou']}) ---")
     pbar = tqdm(loader, desc=f"FT Ep {epoch}")
 
     for step, bt in enumerate(pbar):
-        if bt is None: continue
-        images, commands, gt_bboxes = bt
+        images, commands, gt_bboxes, _ = bt  # command_token 무시
         images = images.to(device)
         gt_bboxes = gt_bboxes.to(device)
 
-        # 1. Text Embedding (Teacher Text Encoder 사용)
+        # Text Embedding
         with torch.no_grad():
             text_emb = encode_text(commands, tokenizer, teacher_model, device)
         
-        # 2. Forward Pass (Image + Text -> BBox Prediction)
+        # Forward
         pred_bboxes = model(images, text_emb)
         
-        # 3. Loss Calculation (L1 + GIoU)
+        # Loss
         L_total, L_l1, L_giou = loss_fn(pred_bboxes, gt_bboxes, weights)
 
-        # 4. Backward
         optimizer.zero_grad()
         L_total.backward()
         optimizer.step()
@@ -124,34 +234,28 @@ def fine_tune_epoch(model, loss_fn, optimizer, loader, tokenizer, teacher_model,
         acc += L_total.item()
         s += 1
         
-        # 로그에 세부 Loss 표시
         pbar.set_postfix({'Total': f"{acc/s:.3f}", 'L1': f"{L_l1.item():.3f}", 'GIoU': f"{L_giou.item():.3f}"})
 
     return acc / s if s > 0 else 0
 
 def evaluate_talk2car(model, loader, tokenizer, teacher_model, device, cfg):
-    """
-    Talk2Car 데이터셋에 대해 모델을 평가하고 평균 IoU 및 AP50을 계산합니다.
-    """
+    """Talk2Car Validation 평가"""
     model.eval()
     total_iou = 0
-    total_correct_05 = 0 # AP50 (IoU >= 0.5) 측정을 위한 카운터
+    total_correct_05 = 0
     total_samples = 0
     
     print("\n--- Evaluating Talk2Car ---")
     with torch.no_grad():
         for bt in tqdm(loader, desc="Evaluating"):
-            images, commands, gt_bboxes = bt
+            images, commands, gt_bboxes, _ = bt
             images = images.to(device)
             gt_bboxes = gt_bboxes.to(device)
             
             text_emb = encode_text(commands, tokenizer, teacher_model, device)
             pred_bboxes = model(images, text_emb)
             
-            # IoU 계산 (Batch 단위)
-            # Box format: [x, y, w, h] (Normalized 0~1)
-            
-            # [x1, y1, x2, y2]로 변환
+            # IoU 계산
             pred_x1 = pred_bboxes[:, 0]
             pred_y1 = pred_bboxes[:, 1]
             pred_x2 = pred_bboxes[:, 0] + pred_bboxes[:, 2]
@@ -162,7 +266,6 @@ def evaluate_talk2car(model, loader, tokenizer, teacher_model, device, cfg):
             gt_x2 = gt_bboxes[:, 0] + gt_bboxes[:, 2]
             gt_y2 = gt_bboxes[:, 1] + gt_bboxes[:, 3]
 
-            # Intersection 영역 계산
             inter_x1 = torch.max(pred_x1, gt_x1)
             inter_y1 = torch.max(pred_y1, gt_y1)
             inter_x2 = torch.min(pred_x2, gt_x2)
@@ -172,15 +275,12 @@ def evaluate_talk2car(model, loader, tokenizer, teacher_model, device, cfg):
             inter_h = (inter_y2 - inter_y1).clamp(min=0)
             inter_area = inter_w * inter_h
             
-            # Union 영역 계산
             pred_area = pred_bboxes[:, 2] * pred_bboxes[:, 3]
             gt_area = gt_bboxes[:, 2] * gt_bboxes[:, 3]
             union_area = pred_area + gt_area - inter_area
             
-            # IoU 벡터 계산
             iou = inter_area / (union_area + 1e-6)
             
-            # 통계 누적
             total_iou += iou.sum().item()
             total_correct_05 += (iou >= 0.5).sum().item()
             total_samples += images.size(0)
@@ -189,14 +289,74 @@ def evaluate_talk2car(model, loader, tokenizer, teacher_model, device, cfg):
     ap50 = (total_correct_05 / total_samples) * 100 if total_samples > 0 else 0
     
     print(f"Average IoU: {avg_iou:.4f}")
-    print(f"AP50 (IoU >= 0.5): {ap50:.2f}%") # 리더보드 비교용 지표
+    print(f"AP50 (IoU >= 0.5): {ap50:.2f}%")
     
     return avg_iou, ap50
 
+# ==============================================================================
+# TEST INFERENCE: predictions.json 생성 (NEW)
+# ==============================================================================
+
+def generate_predictions_json(model, test_loader, tokenizer, teacher_model, device, save_path, cfg):
+    """
+    Talk2Car Test set에 대한 predictions.json 생성
+    
+    Format: {command_token: [x0, y0, w, h]}
+    - Absolute coordinates (pixels)
+    - Talk2Car 이미지 크기: 1600 x 900
+    """
+    model.eval()
+    predictions = {}
+    
+    print(f"\n🚀 Generating predictions.json for Talk2Car test set...")
+    
+    # Talk2Car 표준 이미지 크기
+    IMG_WIDTH = 1600
+    IMG_HEIGHT = 900
+    
+    with torch.no_grad():
+        for batch in tqdm(test_loader, desc="Test Inference"):
+            images, commands, _, command_tokens = batch
+            images = images.to(device)
+            
+            # Text Embedding
+            text_emb = encode_text(commands, tokenizer, teacher_model, device)
+            
+            # Prediction (Normalized [0~1])
+            pred_bboxes = model(images, text_emb)  # [B, 4]
+            
+            # Denormalize to absolute coordinates
+            for i, token in enumerate(command_tokens):
+                x_norm, y_norm, w_norm, h_norm = pred_bboxes[i].cpu().numpy()
+                
+                # Normalized -> Absolute
+                x0 = int(x_norm * IMG_WIDTH)
+                y0 = int(y_norm * IMG_HEIGHT)
+                w = int(w_norm * IMG_WIDTH)
+                h = int(h_norm * IMG_HEIGHT)
+                
+                # Clamp to image bounds
+                x0 = max(0, min(x0, IMG_WIDTH - 1))
+                y0 = max(0, min(y0, IMG_HEIGHT - 1))
+                w = max(1, min(w, IMG_WIDTH - x0))
+                h = max(1, min(h, IMG_HEIGHT - y0))
+                
+                predictions[token] = [x0, y0, w, h]
+    
+    # Save JSON
+    with open(save_path, 'w') as f:
+        json.dump(predictions, f, indent=2)
+    
+    print(f"✅ Predictions saved to {save_path}")
+    print(f"   Total predictions: {len(predictions)}")
+    print(f"   Format: {{command_token: [x0, y0, w, h]}}")
+    print(f"\n📤 Ready for submission to Talk2Car leaderboard!")
+    print(f"   URL: https://eval.ai/web/challenges/challenge-page/835/overview")
+    
+    return predictions
+
 def inference_and_visualize(model, loader, tokenizer, teacher_model, device, save_dir, max_vis=50):
-    """
-    Test 셋에 대해 추론을 수행하고, 일부 결과를 이미지로 저장합니다.
-    """
+    """Test 셋 시각화"""
     model.eval()
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -210,20 +370,18 @@ def inference_and_visualize(model, loader, tokenizer, teacher_model, device, sav
     
     with torch.no_grad():
         for i, bt in enumerate(tqdm(loader, desc="Testing")):
-            images, commands, gt_bboxes = bt
+            images, commands, gt_bboxes, _ = bt
             images = images.to(device)
             gt_bboxes = gt_bboxes.to(device)
             
-            text_emb = encode_text(commands, tokenizer, teacher_model, device) # encode_text 함수 필요
+            text_emb = encode_text(commands, tokenizer, teacher_model, device)
             pred_bboxes = model(images, text_emb)
             
-            # Batch 내의 각 샘플에 대해 처리
             for j in range(images.size(0)):
-                # IoU 계산
-                p_box = pred_bboxes[j] # [x, y, w, h]
+                p_box = pred_bboxes[j]
                 g_box = gt_bboxes[j]
                 
-                # 좌표 변환 [x1, y1, x2, y2]
+                # IoU 계산
                 p_x1, p_y1 = p_box[0], p_box[1]
                 p_x2, p_y2 = p_box[0] + p_box[2], p_box[1] + p_box[3]
                 
@@ -242,16 +400,13 @@ def inference_and_visualize(model, loader, tokenizer, teacher_model, device, sav
                 
                 iou = (inter_area / (union_area + 1e-6)).item()
                 
-                # 통계 누적
                 total_iou += iou
                 if iou >= 0.5:
                     total_correct_05 += 1
                 count += 1
                 
-                # 시각화 저장 (제한된 개수만큼만)
+                # 시각화
                 if vis_count < max_vis:
-                    # 이미지 파일명 생성 (ex: test_0_iou_0.85.jpg)
-                    # 공백이나 특수문자 제거
                     clean_cmd = "".join(c for c in commands[j] if c.isalnum())[:20]
                     fname = f"vis_{vis_count:03d}_iou_{iou:.2f}_{clean_cmd}.jpg"
                     
@@ -275,30 +430,22 @@ def inference_and_visualize(model, loader, tokenizer, teacher_model, device, sav
     return avg_iou, ap50
 
 # ==============================================================================
-# Stage 1 Evaluation Utilities
+# Stage 1 Evaluation
 # ==============================================================================
 
 def recall_at_k(query_emb, emb_set, text_set, keyword, k=10):
-    """
-    주어진 쿼리 임베딩에 대해 임베딩 세트에서 Recall@K를 계산합니다.
-    """
+    """Recall@K 계산"""
     if len(emb_set) == 0: return 0.0, []
     
-    # 코사인 유사도 계산
     sims = cosine_similarity(query_emb, emb_set)[0]
-    
-    # 상위 K개 인덱스 추출
     topk_idx = sims.argsort()[::-1][:k]
     topk_labels = [text_set[i] for i in topk_idx]
     
-    # Recall 계산 (키워드가 포함된 항목 수 / K)
     recall = sum([keyword in lbl for lbl in topk_labels]) / k
     return recall, list(zip(sims[topk_idx], topk_labels))
 
 def evaluate_retrieval(student_encoder, loader, tokenizer, teacher_model, device, cfg):
-    """
-    영역 은행(Region Bank)을 구축하고 크기별(Small/Large) Recall@K를 분석합니다.
-    """
+    """Region Bank 기반 Retrieval 평가"""
     student_encoder.eval()
     teacher_model.eval()
 
@@ -330,7 +477,6 @@ def evaluate_retrieval(student_encoder, loader, tokenizer, teacher_model, device
 
     embs_np = region_embs.numpy()
     
-    # 텍스트 기반으로 Small/Large 영역 분리 (COCO Region 텍스트 특성 활용)
     def is_small(t: str):
         ts = t.lower()
         return ("very small" in ts) or ("a small" in ts)
@@ -358,7 +504,6 @@ def evaluate_retrieval(student_encoder, loader, tokenizer, teacher_model, device
     for cls in target_classes:
         q_small_text = f"a small {cls}"
         
-        # 쿼리 임베딩
         q_emb = encode_text([q_small_text], tokenizer, teacher_model, device)
         q_emb = F.normalize(q_emb, dim=-1).cpu().numpy()
 
@@ -367,7 +512,6 @@ def evaluate_retrieval(student_encoder, loader, tokenizer, teacher_model, device
 
         results.append((cls, len([t for t in text_small if cls in t]), len([t for t in text_large if cls in t]), r_small, r_large))
 
-    # 결과 요약 출력
     print("\n===== SUMMARY (class-wise small vs large) =====")
     print(f"{'class':13s} | {'#small':>7s} | {'#large':>7s} | {'SmallR@10':>9s} | {'LargeR@10':>9s}")
     for cls, n_s, n_l, rs, rl in results:
