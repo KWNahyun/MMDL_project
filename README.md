@@ -23,6 +23,7 @@ MMDL/
 │   ├── dataset.py           # Stage 1용 COCORegionTextDataset 정의
 │   ├── talk2car_dataset.py  # [New] Stage 2용 Talk2CarDataset 및 파싱 로직 정의
 │   ├── loss.py              # 복합 Loss (InfoNCE, SimKD, Post-Cosine) 정의
+│   ├── visualization.py     # [New] 결과 시각화 유틸리티
 │   └── training.py          # Stage 1(증류) 및 Stage 2(파인튜닝) 훈련/평가 루프
 ├── results/                 # [New] 실험 결과 저장소 (main.py 실행 시 자동 생성)
 │   └── result_YYYYMMDD_...  # 실행 시점별 로그(log), 설정(yaml), 가중치(pth) 저장
