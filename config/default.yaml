@@ -19,7 +19,7 @@ DATA_URLS:
 TEACHER_MODEL: "convnext_base_w"
 TEACHER_PRETRAIN: "laion2b_s13b_b82k"
 STUDENT_MODEL_BACKBONE: "convnext_tiny"
-IMAGE_SIZE: 224
+IMAGE_SIZE: 384
 
 # ==================================
 # 3. 데이터셋 설정 (Stage 1)
@@ -62,10 +62,11 @@ TALK2CAR:
   # Cross-modal Head 구조
   HEAD_TYPE: "Transformer" 
   # HEAD_TYPE: "Projection" 
+  VIS_COUNT: 50
   
   # 2단계 훈련 하이퍼파라미터
   FINE_TUNE:
-    NUM_EPOCHS: 50
+    NUM_EPOCHS: 2
     BATCH_SIZE: 16
     LEARNING_RATE: 1.0e-5 # 파인튜닝은 낮은 LR 사용
     NUM_WORKERS: 2

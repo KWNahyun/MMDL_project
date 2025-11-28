@@ -4,6 +4,8 @@ import open_clip
 from tqdm import tqdm
 from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
+from utils.visualization import save_visualization
+from pathlib import Path
 
 # ==============================================================================
 # Helper Functions
@@ -188,6 +190,87 @@ def evaluate_talk2car(model, loader, tokenizer, teacher_model, device, cfg):
     
     print(f"Average IoU: {avg_iou:.4f}")
     print(f"AP50 (IoU >= 0.5): {ap50:.2f}%") # 리더보드 비교용 지표
+    
+    return avg_iou, ap50
+
+def inference_and_visualize(model, loader, tokenizer, teacher_model, device, save_dir, max_vis=50):
+    """
+    Test 셋에 대해 추론을 수행하고, 일부 결과를 이미지로 저장합니다.
+    """
+    model.eval()
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+    
+    print(f"\n--- Running Inference on Test Set (Saving {max_vis} visualizations) ---")
+    
+    total_iou = 0
+    total_correct_05 = 0
+    count = 0
+    vis_count = 0
+    
+    with torch.no_grad():
+        for i, bt in enumerate(tqdm(loader, desc="Testing")):
+            images, commands, gt_bboxes = bt
+            images = images.to(device)
+            gt_bboxes = gt_bboxes.to(device)
+            
+            text_emb = encode_text(commands, tokenizer, teacher_model, device) # encode_text 함수 필요
+            pred_bboxes = model(images, text_emb)
+            
+            # Batch 내의 각 샘플에 대해 처리
+            for j in range(images.size(0)):
+                # IoU 계산
+                p_box = pred_bboxes[j] # [x, y, w, h]
+                g_box = gt_bboxes[j]
+                
+                # 좌표 변환 [x1, y1, x2, y2]
+                p_x1, p_y1 = p_box[0], p_box[1]
+                p_x2, p_y2 = p_box[0] + p_box[2], p_box[1] + p_box[3]
+                
+                g_x1, g_y1 = g_box[0], g_box[1]
+                g_x2, g_y2 = g_box[0] + g_box[2], g_box[1] + g_box[3]
+                
+                inter_x1 = torch.max(p_x1, g_x1)
+                inter_y1 = torch.max(p_y1, g_y1)
+                inter_x2 = torch.min(p_x2, g_x2)
+                inter_y2 = torch.min(p_y2, g_y2)
+                
+                inter_area = (inter_x2 - inter_x1).clamp(min=0) * (inter_y2 - inter_y1).clamp(min=0)
+                pred_area = p_box[2] * p_box[3]
+                gt_area = g_box[2] * g_box[3]
+                union_area = pred_area + gt_area - inter_area
+                
+                iou = (inter_area / (union_area + 1e-6)).item()
+                
+                # 통계 누적
+                total_iou += iou
+                if iou >= 0.5:
+                    total_correct_05 += 1
+                count += 1
+                
+                # 시각화 저장 (제한된 개수만큼만)
+                if vis_count < max_vis:
+                    # 이미지 파일명 생성 (ex: test_0_iou_0.85.jpg)
+                    # 공백이나 특수문자 제거
+                    clean_cmd = "".join(c for c in commands[j] if c.isalnum())[:20]
+                    fname = f"vis_{vis_count:03d}_iou_{iou:.2f}_{clean_cmd}.jpg"
+                    
+                    save_visualization(
+                        images[j], 
+                        commands[j], 
+                        p_box.cpu(), 
+                        g_box.cpu(), 
+                        save_dir / fname,
+                        iou
+                    )
+                    vis_count += 1
+
+    avg_iou = total_iou / count if count > 0 else 0
+    ap50 = (total_correct_05 / count) * 100 if count > 0 else 0
+    
+    print(f"\n[Test Result] Average IoU: {avg_iou:.4f}")
+    print(f"[Test Result] AP50 (IoU >= 0.5): {ap50:.2f}%")
+    print(f"[Visualization] Saved {vis_count} images to {save_dir}")
     
     return avg_iou, ap50
 
