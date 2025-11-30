@@ -36,14 +36,14 @@ warnings.filterwarnings('ignore')
 # === Logging Helper ===
 class Logger(object):
     """콘솔 출력을 파일과 터미널에 동시 출력"""
-    def __init__(self, filename):
-        self.terminal = sys.stdout
+    def __init__(self, filename, stream): # stream 인자 추가 (stdout 또는 stderr)
+        self.terminal = stream
         self.log = open(filename, "a", encoding='utf-8')
 
     def write(self, message):
         self.terminal.write(message)
         self.log.write(message)
-        self.log.flush()
+        self.log.flush() # 즉시 파일에 쓰기
 
     def flush(self):
         self.terminal.flush()
@@ -75,9 +75,10 @@ def setup_experiment(cfg):
     result_dir = Path(cfg['ROOT_DIR']) / "results" / f"result_{timestamp}"
     result_dir.mkdir(parents=True, exist_ok=True)
     
-    # 로깅
+    # [수정] 로깅 설정: stdout과 stderr 모두 Logger로 교체
     log_file = result_dir / "training.log"
-    sys.stdout = Logger(log_file)
+    sys.stdout = Logger(log_file, sys.stdout)
+    sys.stderr = Logger(log_file, sys.stderr) # 에러 메시지도 기록
     
     print(f"[Experiment] Result Directory: {result_dir}")
     print(f"[Experiment] Logs: {log_file}")
@@ -395,18 +396,44 @@ def main():
             text_dim, cfg['STUDENT_MODEL_BACKBONE'], device
         )
 
-        try:
-            student_encoder = torch.compile(student_encoder)
-            print("[Info] Student Model compiled with torch.compile() 🚀")
-        except:
-            pass
+        # try:
+        #     student_encoder = torch.compile(student_encoder)
+        #     print("[Info] Student Model compiled with torch.compile() 🚀")
+        # except:
+        #     pass
         
         talk2car_model = Talk2CarModel(
             student_encoder, text_dim, 
             head_type=cfg['TALK2CAR']['HEAD_TYPE']
         ).to(device)
         
-        talk2car_model.load_state_dict(torch.load(best_model_path))
+        # [MODIFIED] State Dict 로딩 수정 (접두어 제거)
+        checkpoint = torch.load(best_model_path)
+        
+        # Check if the file contains the state_dict directly or nested
+        if 'state_dict' in checkpoint:
+            state_dict = checkpoint['state_dict']
+        elif 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+        else:
+            state_dict = checkpoint
+
+        new_state_dict = {}
+        for key, value in state_dict.items():
+            # Remove "_orig_mod." prefix if present
+            new_key = key.replace("_orig_mod.", "")
+            new_state_dict[new_key] = value
+            
+        try:
+            talk2car_model.load_state_dict(new_state_dict, strict=True)
+            print("[Info] Successfully loaded model weights with prefix stripping.")
+        except RuntimeError as e:
+            print(f"[Warning] Strict loading failed: {e}")
+            print("[Info] Retrying with strict=False...")
+            # If strict loading fails, try loading what matches (optional, use with caution)
+            talk2car_model.load_state_dict(new_state_dict, strict=False)
+            print("[Info] Loaded model with strict=False.")
+
         talk2car_model.eval()
         
         # 3. Test Dataset 로드

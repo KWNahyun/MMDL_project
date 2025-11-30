@@ -61,4 +61,5 @@ https://github.com/talk2car/Talk2Car 의 README.md 파일을 참고하여 Talk2C
 python3 main.py --stage 1
 python3 main.py --stage 2
 python3 main.py --stage all
+python3 main.py --stage all --generate_predictions --visualize --detailed_analysis
 ```

@@ -25,7 +25,8 @@ STUDENT_WEIGHTS_PATH: "results/latest/distilled_weights.pth"
 
 # 이미지 설정
 # IMAGE_SIZE: 224
-IMAGE_SIZE: 384  
+# IMAGE_SIZE: 384  
+IMAGE_SIZE: 448
 # IMAGE_SIZE: 512
 
 # Stage 1: COCO Distillation 설정
