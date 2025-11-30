@@ -1,6 +1,7 @@
 # utils/training.py
 import torch
 import torch.nn.functional as F
+from torch.cuda.amp import autocast, GradScaler
 import open_clip
 from tqdm import tqdm
 from sklearn.metrics.pairwise import cosine_similarity
@@ -148,15 +149,17 @@ def adapt_teacher_to_talk2car(teacher_model, tokenizer, t2c_dir, device, cfg):
 # Stage 1: Knowledge Distillation
 # ==============================================================================
 
+# train_epoch 함수 수정
 def train_epoch(student_encoder, clip_loss_fn, optimizer, loader, tokenizer, teacher_model, device, cfg, epoch):
-    """Stage 1 훈련 에포크"""
     student_encoder.train()
     clip_loss_fn.train()
-    s, acc = 0, 0
     
+    # [NEW] Scaler 초기화
+    scaler = GradScaler()
+    
+    s, acc = 0, 0
     weights = cfg['TRAIN']['LOSS_WEIGHTS']
     
-    print(f"\n--- [Stage 1] Epoch {epoch} (Weights: {weights}) ---")
     pbar = tqdm(loader, desc=f"Ep {epoch}")
 
     for step, bt in enumerate(pbar):
@@ -164,36 +167,40 @@ def train_epoch(student_encoder, clip_loss_fn, optimizer, loader, tokenizer, tea
         images, texts = bt
         images = images.to(device)
 
-        # Teacher Outputs (Frozen)
-        txt_emb_teacher = encode_text(texts, tokenizer, teacher_model, device)
-        img_emb_teacher = encode_image_teacher(images, teacher_model)
-        
-        # Student Output
-        img_emb_student = student_encoder(images)
-
-        # Teacher Logits
+        # 1. Teacher (FP16으로 실행 권장 - 원래 CLIP은 FP16 학습됨)
         with torch.no_grad():
-            t_img_norm = F.normalize(img_emb_teacher, dim=-1)
-            t_txt_norm = F.normalize(txt_emb_teacher, dim=-1)
-            logits_teacher = t_img_norm @ t_txt_norm.t()
+            with autocast(): # Teacher도 가볍게
+                txt_emb_teacher = encode_text(texts, tokenizer, teacher_model, device)
+                img_emb_teacher = encode_image_teacher(images, teacher_model)
+                
+                # Normalize
+                t_img_norm = F.normalize(img_emb_teacher, dim=-1)
+                t_txt_norm = F.normalize(txt_emb_teacher, dim=-1)
+                logits_teacher = t_img_norm @ t_txt_norm.t()
 
-        # Loss
-        L_total, L_clip, L_cos, L_sim = clip_loss_fn(
-            img_emb_student=img_emb_student,
-            txt_emb_teacher=txt_emb_teacher,
-            img_emb_teacher=img_emb_teacher,
-            logits_teacher=logits_teacher,
-            weights=weights
-        )
-
+        # 2. Student 학습 (Mixed Precision 적용)
         optimizer.zero_grad()
-        L_total.backward()
-        optimizer.step()
+        
+        with autocast(): # [핵심] 연산을 FP16으로 수행
+            img_emb_student = student_encoder(images)
+            
+            L_total, L_clip, L_cos, L_sim = clip_loss_fn(
+                img_emb_student=img_emb_student,
+                txt_emb_teacher=txt_emb_teacher,
+                img_emb_teacher=img_emb_teacher,
+                logits_teacher=logits_teacher,
+                weights=weights
+            )
+
+        # 3. Scaler로 역전파 (Gradient Scaling)
+        scaler.scale(L_total).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
         acc += L_total.item()
         s += 1
         
-        pbar.set_postfix({'Loss': f"{acc/s:.4f}", 'CLIP': f"{L_clip.item():.2f}"})
+        pbar.set_postfix({'Loss': f"{acc/s:.4f}"})
 
     return acc / s if s > 0 else 0
 

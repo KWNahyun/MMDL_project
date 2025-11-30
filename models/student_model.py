@@ -36,63 +36,141 @@ class DistilledConvNeXtTiny(nn.Module):
         return self.backbone(x)
 
 
+# class DistilledConvNeXtTinyMultiScale(nn.Module):
+#     """
+#     Multi-Scale Student 모델
+#     - 작은 객체와 큰 객체를 모두 잘 잡기 위해 여러 계층의 Feature를 융합
+#     - ConvNeXt의 Stage 2, 3, 4 출력을 결합
+#     """
+#     def __init__(self, text_dim, backbone_name="convnext_tiny"):
+#         super().__init__()
+#         # features_only=True: 중간 레이어의 Feature Map들을 리스트로 반환
+#         self.backbone = timm.create_model(
+#             backbone_name, 
+#             pretrained=True, 
+#             features_only=True, 
+#             out_indices=(1, 2, 3)  # Stage 2(1/8), 3(1/16), 4(1/32) 추출
+#         )
+        
+#         # Feature 차원 융합 (1x1 Conv)
+#         # Stage 2(192) + Stage 3(384) + Stage 4(768) = 1344 채널
+#         # 이를 256 채널로 압축하여 Transformer 입력으로 사용
+#         self.fusion = nn.Sequential(
+#             nn.Conv2d(1344, 256, kernel_size=1),
+#             nn.BatchNorm2d(256),
+#             nn.ReLU(inplace=True)
+#         )
+        
+#         # Stage 1용 Head
+#         self.pool = nn.AdaptiveAvgPool2d(1)
+#         self.head = nn.Linear(256, text_dim)
+        
+#         self.num_features = 256
+
+#     def _get_fused_features(self, x):
+#         """Feature 추출 및 Multi-scale Fusion 공통 로직"""
+#         # c2: 1/8 scale, c3: 1/16 scale, c4: 1/32 scale
+#         c2, c3, c4 = self.backbone(x)
+#         h, w = c2.shape[-2:] # 가장 큰 해상도(c2) 기준
+        
+#         # Upsampling하여 크기 맞춤 (Interpolation)
+#         c3 = F.interpolate(c3, size=(h, w), mode='bilinear', align_corners=False)
+#         c4 = F.interpolate(c4, size=(h, w), mode='bilinear', align_corners=False)
+        
+#         # 채널 방향으로 결합 (Concat)
+#         concat_feat = torch.cat([c2, c3, c4], dim=1) # [B, 1344, H, W]
+        
+#         # 채널 압축 (Fusion)
+#         fused_feat = self.fusion(concat_feat) # [B, 256, H, W]
+#         return fused_feat
+
+#     def forward(self, x):
+#         """Stage 1: Distillation용 (Global Feature)"""
+#         fused = self._get_fused_features(x) # [B, 256, H, W]
+#         pooled = self.pool(fused).flatten(1) # [B, 256]
+#         return self.head(pooled)
+    
+#     def get_spatial_features(self, x):
+#         """Stage 2: Grounding용 (Spatial Feature) - No Pooling"""
+#         return self._get_fused_features(x) # [B, 256, H, W] 그대로 반환
+
+
 class DistilledConvNeXtTinyMultiScale(nn.Module):
-    """
-    Multi-Scale Student 모델
-    - 작은 객체와 큰 객체를 모두 잘 잡기 위해 여러 계층의 Feature를 융합
-    - ConvNeXt의 Stage 2, 3, 4 출력을 결합
-    """
     def __init__(self, text_dim, backbone_name="convnext_tiny"):
         super().__init__()
-        # features_only=True: 중간 레이어의 Feature Map들을 리스트로 반환
+        # [수정 1] out_indices에 0번(Stride 4) 추가 -> 작은 객체 정보 확보
         self.backbone = timm.create_model(
             backbone_name, 
             pretrained=True, 
             features_only=True, 
-            out_indices=(1, 2, 3)  # Stage 2(1/8), 3(1/16), 4(1/32) 추출
+            out_indices=(0, 1, 2, 3)
         )
         
-        # Feature 차원 융합 (1x1 Conv)
-        # Stage 2(192) + Stage 3(384) + Stage 4(768) = 1344 채널
-        # 이를 256 채널로 압축하여 Transformer 입력으로 사용
+        # 채널 정의 (ConvNeXt-Tiny 기준: 96, 192, 384, 768)
+        dims = self.backbone.feature_info.channels() # [96, 192, 384, 768]
+        
+        # 각 스케일별 투영 레이어 (모두 256 채널로 통일)
+        self.proj_c0 = nn.Conv2d(dims[0], 256, kernel_size=3, padding=1, stride=2) # Stride 4 -> 8 (Downsample)
+        self.proj_c1 = nn.Conv2d(dims[1], 256, kernel_size=1)                      # Stride 8 -> 8 (Keep)
+        self.proj_c2 = nn.Conv2d(dims[2], 256, kernel_size=1)                      # Stride 16 -> 8 (Upsample)
+        self.proj_c3 = nn.Conv2d(dims[3], 256, kernel_size=1)                      # Stride 32 -> 8 (Upsample)
+        
+        # [수정 2] CoordConv용 추가 채널 (256 + 2 = 258)
         self.fusion = nn.Sequential(
-            nn.Conv2d(1344, 256, kernel_size=1),
+            nn.Conv2d(256 * 4 + 2, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 256, kernel_size=3, padding=1), # Refinement
             nn.BatchNorm2d(256),
             nn.ReLU(inplace=True)
         )
         
-        # Stage 1용 Head
         self.pool = nn.AdaptiveAvgPool2d(1)
         self.head = nn.Linear(256, text_dim)
-        
         self.num_features = 256
 
     def _get_fused_features(self, x):
-        """Feature 추출 및 Multi-scale Fusion 공통 로직"""
-        # c2: 1/8 scale, c3: 1/16 scale, c4: 1/32 scale
-        c2, c3, c4 = self.backbone(x)
-        h, w = c2.shape[-2:] # 가장 큰 해상도(c2) 기준
+        # c0: 1/4, c1: 1/8, c2: 1/16, c3: 1/32
+        c0, c1, c2, c3 = self.backbone(x)
         
-        # Upsampling하여 크기 맞춤 (Interpolation)
-        c3 = F.interpolate(c3, size=(h, w), mode='bilinear', align_corners=False)
-        c4 = F.interpolate(c4, size=(h, w), mode='bilinear', align_corners=False)
+        # 1. 모든 피처를 Stride 8 (c1 크기)로 맞춤
+        # c0 (Stride 4) -> Convolution으로 줄임 (정보 압축)
+        f0 = self.proj_c0(c0) 
         
-        # 채널 방향으로 결합 (Concat)
-        concat_feat = torch.cat([c2, c3, c4], dim=1) # [B, 1344, H, W]
+        # c1 (Stride 8) -> 그대로
+        f1 = self.proj_c1(c1)
         
-        # 채널 압축 (Fusion)
-        fused_feat = self.fusion(concat_feat) # [B, 256, H, W]
-        return fused_feat
+        # c2, c3 -> Interpolation으로 늘림
+        h, w = c1.shape[-2:]
+        f2 = F.interpolate(self.proj_c2(c2), size=(h, w), mode='bilinear', align_corners=False)
+        f3 = F.interpolate(self.proj_c3(c3), size=(h, w), mode='bilinear', align_corners=False)
+        
+        # 2. Concat
+        x_feat = torch.cat([f0, f1, f2, f3], dim=1) # [B, 1024, H, W]
+
+        # [수정 3] Coordinate Channel 추가 (CoordConv)
+        # 모델이 "여기가 왼쪽 위다, 오른쪽 아래다"를 명시적으로 알게 해줌
+        batch_size, _, height, width = x_feat.shape
+        
+        xx_channel = torch.arange(width, dtype=x_feat.dtype, device=x_feat.device).view(1, 1, 1, width).expand(batch_size, 1, height, width)
+        yy_channel = torch.arange(height, dtype=x_feat.dtype, device=x_feat.device).view(1, 1, height, 1).expand(batch_size, 1, height, width)
+        
+        # Normalize to [-1, 1]
+        xx_channel = (xx_channel / (width - 1)) * 2 - 1
+        yy_channel = (yy_channel / (height - 1)) * 2 - 1
+        
+        x_feat = torch.cat([x_feat, xx_channel, yy_channel], dim=1) # [B, 1026, H, W]
+        
+        # 3. Final Fusion
+        return self.fusion(x_feat)
 
     def forward(self, x):
-        """Stage 1: Distillation용 (Global Feature)"""
-        fused = self._get_fused_features(x) # [B, 256, H, W]
-        pooled = self.pool(fused).flatten(1) # [B, 256]
+        fused = self._get_fused_features(x)
+        pooled = self.pool(fused).flatten(1)
         return self.head(pooled)
     
     def get_spatial_features(self, x):
-        """Stage 2: Grounding용 (Spatial Feature) - No Pooling"""
-        return self._get_fused_features(x) # [B, 256, H, W] 그대로 반환
+        return self._get_fused_features(x)
 
 
 class Talk2CarModel(nn.Module):

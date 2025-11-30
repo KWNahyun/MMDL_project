@@ -7,6 +7,7 @@ ROOT_DIR: "./"
 
 # 데이터셋 경로
 COCO_DIR_NAME: "coco2017"
+KITTI_DIR_NAME: "kitti"
 
 # [FIX] 누락된 DATA_URLS 추가
 DATA_URLS:
@@ -18,13 +19,14 @@ TEACHER_MODEL: "convnext_base_w"
 TEACHER_PRETRAIN: "laion2b_s13b_b82k"
 TEACHER_WEIGHTS_PATH: "teacher_talk2car_adapted.pth"  # Stage 0 결과물
 
-STUDENT_MODEL_BACKBONE: "convnext_tiny"  # or "convnext_tiny_multiscale"
+# STUDENT_MODEL_BACKBONE: "convnext_tiny"  # or "convnext_tiny_multiscale"
+STUDENT_MODEL_BACKBONE: "convnext_tiny_multiscale"
 STUDENT_WEIGHTS_PATH: "results/latest/distilled_weights.pth"
 
 # 이미지 설정
 # IMAGE_SIZE: 224
-# IMAGE_SIZE: 384  
-IMAGE_SIZE: 512
+IMAGE_SIZE: 384  
+# IMAGE_SIZE: 512
 
 # Stage 1: COCO Distillation 설정
 MAX_IMAGES_TRAINING: null  # null이면 전체 사용
@@ -57,7 +59,7 @@ TRAIN:
   NUM_EPOCHS: 10
   LEARNING_RATE: 1e-4
   WEIGHT_DECAY: 0.01
-  NUM_WORKERS: 4
+  NUM_WORKERS: 8
   TEMPERATURE: 0.07
   
   # Loss 가중치 (InfoNCE + SimKD + PostCosine)
@@ -80,6 +82,8 @@ AUGMENTATION:
   SHIFT_SCALE: 0.05
   NOISE_BLUR: 0.3
 
+DOMAIN_OVERSAMPLE_RATI: 5
+
 # Stage 2: Talk2Car Fine-tuning 설정 (통합됨)
 TALK2CAR:
   DIR_NAME: "Talk2Car/data"
@@ -89,14 +93,14 @@ TALK2CAR:
   
   FINE_TUNE:
     BATCH_SIZE: 32
-    NUM_EPOCHS: 30
-    LEARNING_RATE: 5e-5
+    NUM_EPOCHS: 50
+    LEARNING_RATE: 1e-4
     NUM_WORKERS: 4
     
     # Loss 가중치 (L1 + GIoU)
     LOSS_WEIGHTS:
-      w_l1: 1.0
-      w_giou: 2.0
+      w_l1: 0.5
+      w_giou: 3.0
     
     # Focal Loss (선택적)
     USE_FOCAL: false

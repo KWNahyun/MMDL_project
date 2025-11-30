@@ -6,21 +6,51 @@ import sys
 
 def download_and_setup_data(cfg):
     """
-    COCO 데이터셋을 다운로드하고 압축을 해제합니다.
+    COCO 및 KITTI 데이터셋을 다운로드하고 압축을 해제합니다.
     """
     ROOT = Path(cfg['ROOT_DIR'])
-    ROOT.mkdir(parents=True, exist_ok=True) # MMDL 폴더 생성 보장
+    ROOT.mkdir(parents=True, exist_ok=True) # ROOT 폴더 생성 보장
     
-    COCO_DIR = ROOT / cfg['COCO_DIR_NAME']
+    # 1. 디렉토리 설정
+    COCO_DIR = ROOT / cfg.get('COCO_DIR_NAME', 'coco')
+    KITTI_DIR = ROOT / cfg.get('KITTI_DIR_NAME', 'kitti')
+    
     COCO_DIR.mkdir(parents=True, exist_ok=True)
+    KITTI_DIR.mkdir(parents=True, exist_ok=True)
 
-    # config의 DATA_URLS 가져오기
-    urls = cfg['DATA_URLS']
+    # 2. URL 설정
+    # COCO URL (Config에서 가져옴)
+    coco_urls = cfg['DATA_URLS']
     
-    # URL과 저장할 파일명 매핑
+    # KITTI URL (ipynb 참고: AWS S3 미러 사용)
+    kitti_img_url = "https://s3.eu-central-1.amazonaws.com/avg-kitti/data_object_image_2.zip"
+    kitti_lbl_url = "https://s3.eu-central-1.amazonaws.com/avg-kitti/data_object_label_2.zip"
+
+    # 다운로드할 파일 목록 정의
+    # Format: "파일명": {"url": URL, "dest": 압축해제경로, "check_path": 압축해제확인폴더}
     targets = {
-        "train2017.zip": urls['IMAGES_ZIP'],
-        "annotations_trainval2017.zip": urls['ANN_ZIP']
+        # --- COCO ---
+        "train2017.zip": {
+            "url": coco_urls['IMAGES_ZIP'],
+            "dest": COCO_DIR,
+            "check": COCO_DIR / "train2017"
+        },
+        "annotations_trainval2017.zip": {
+            "url": coco_urls['ANN_ZIP'],
+            "dest": COCO_DIR,
+            "check": COCO_DIR / "annotations"
+        },
+        # --- KITTI ---
+        "data_object_image_2.zip": {
+            "url": kitti_img_url,
+            "dest": KITTI_DIR,
+            "check": KITTI_DIR / "training" / "image_2"
+        },
+        "data_object_label_2.zip": {
+            "url": kitti_lbl_url,
+            "dest": KITTI_DIR,
+            "check": KITTI_DIR / "training" / "label_2"
+        }
     }
     
     # 다운로드 진행률 표시 훅
@@ -33,54 +63,59 @@ def download_and_setup_data(cfg):
             if readsoFar >= totalsize:
                 sys.stderr.write("\n")
     
-    # 1. 다운로드
-    for filename, url in targets.items():
+    # 3. 처리 루프 (다운로드 -> 압축 해제)
+    for filename, info in targets.items():
         zip_path = ROOT / filename
-        
+        dest_dir = info['dest']
+        check_path = info['check']
+
+        # (1) 다운로드
         if not zip_path.exists():
+            # 이미 압축이 풀려있다면 다운로드 스킵 (선택 사항)
+            if check_path.exists():
+                print(f"[Check] {filename} contents already exist. Skipping download.")
+                continue
+
             print(f"\n[Download] Starting {filename}...")
             try:
-                urllib.request.urlretrieve(url, zip_path, reporthook=reporthook)
+                urllib.request.urlretrieve(info['url'], zip_path, reporthook=reporthook)
                 print(f"Successfully downloaded {filename}")
             except Exception as e:
                 print(f"\n[Error] Download failed for {filename}: {e}")
-                # 실패한 파일이 부분적으로 남아있으면 삭제
                 if zip_path.exists():
                     os.remove(zip_path)
-                return None
+                continue # 다음 파일로 이동
         else:
             print(f"[Check] {filename} already exists. Skipping download.")
 
-    # 2. 압축 해제
+        # (2) 압축 해제
+        if not check_path.exists():
+            print(f"\n[Unzip] Extracting {filename} to {dest_dir}...")
+            try:
+                with zipfile.ZipFile(zip_path, 'r') as zf:
+                    zf.extractall(dest_dir)
+                print("Extraction complete.")
+            except zipfile.BadZipFile:
+                print(f"[Error] {filename} is corrupted. Please delete it and run again.")
+                # os.remove(zip_path) # 자동 삭제를 원하면 주석 해제
+            except Exception as e:
+                print(f"[Error] Unzip failed: {e}")
+        else:
+            print(f"[Check] {filename} is already extracted.")
+
+    # 4. 최종 폴더 구조 확인
+    print("\n--- Data Setup Report ---")
     
-    # (1) 이미지 압축 해제
-    images_zip = ROOT / "train2017.zip"
-    if images_zip.exists() and not (COCO_DIR / "train2017").exists():
-        print(f"\n[Unzip] Extracting {images_zip.name}...")
-        try:
-            with zipfile.ZipFile(images_zip, 'r') as zf:
-                zf.extractall(COCO_DIR)
-            print("Extraction complete.")
-        except zipfile.BadZipFile:
-            print("[Error] train2017.zip is corrupted. Please delete it and run again.")
-            return None
+    coco_ready = (COCO_DIR / "train2017").exists() and (COCO_DIR / "annotations").exists()
+    if coco_ready:
+        print(f"✅ COCO Data Ready at: {COCO_DIR}")
+    else:
+        print(f"❌ COCO Data Incomplete")
 
-    # (2) 주석 압축 해제
-    ann_zip = ROOT / "annotations_trainval2017.zip"
-    if ann_zip.exists() and not (COCO_DIR / "annotations").exists():
-        print(f"\n[Unzip] Extracting {ann_zip.name}...")
-        try:
-            with zipfile.ZipFile(ann_zip, 'r') as zf:
-                zf.extractall(COCO_DIR)
-            print("Extraction complete.")
-        except zipfile.BadZipFile:
-            print("[Error] annotations_trainval2017.zip is corrupted. Please delete it and run again.")
-            return None
+    kitti_ready = (KITTI_DIR / "training" / "image_2").exists() and (KITTI_DIR / "training" / "label_2").exists()
+    if kitti_ready:
+        print(f"✅ KITTI Data Ready at: {KITTI_DIR}")
+    else:
+        print(f"❌ KITTI Data Incomplete")
 
-    # 최종 확인
-    if not (COCO_DIR / "train2017").exists() or not (COCO_DIR / "annotations").exists():
-        print("\n[ERROR] COCO data setup incomplete (Missing extracted folders).")
-        return None
-        
-    print("\n[Success] COCO data is ready.")
-    return COCO_DIR
+    return COCO_DIR if coco_ready else None # 필요에 따라 리턴 값 조정

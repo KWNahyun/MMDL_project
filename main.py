@@ -8,11 +8,20 @@ import argparse
 import sys
 import datetime
 from pathlib import Path
+from torch.utils.data import ConcatDataset
 
 # 모듈 임포트
 from data.download import download_and_setup_data
 from models.student_model import load_student_encoder, Talk2CarModel
-from utils.dataset import COCORegionTextDataset, collate_fn, get_clip_transform, get_augmented_transform
+# [수정] KITTIRegionDataset, Talk2CarRegionDataset 추가 임포트
+from utils.dataset import (
+    COCORegionTextDataset, 
+    # Talk2CarRegionDataset, 
+    KITTIRegionDataset,
+    collate_fn, 
+    get_clip_transform, 
+    get_augmented_transform
+)
 from utils.talk2car_dataset import Talk2CarDataset, talk2car_collate_fn
 from utils.loss import DistillationLosses, Talk2CarLoss
 from utils.training import (
@@ -48,16 +57,16 @@ def load_config(config_path="config/default.yaml"):
 def parse_args():
     parser = argparse.ArgumentParser(description="MMDL Project: Enhanced Talk2Car Pipeline")
     parser.add_argument("--stage", type=str, default="all", 
-                       choices=["0", "1", "2", "all", "test"], 
-                       help="Execution stage (0=Teacher Adapt, 1=Distill, 2=Finetune, test=Inference)")
+                        choices=["0", "1", "2", "all", "test"], 
+                        help="Execution stage (0=Teacher Adapt, 1=Distill, 2=Finetune, test=Inference)")
     parser.add_argument("--resume", type=str, default=None, 
-                       help="Path to checkpoint for resuming")
+                        help="Path to checkpoint for resuming")
     parser.add_argument("--visualize", action="store_true", 
-                       help="Run visualization on test set")
+                        help="Run visualization on test set")
     parser.add_argument("--generate_predictions", action="store_true",
-                       help="Generate predictions.json for leaderboard submission")
+                        help="Generate predictions.json for leaderboard submission")
     parser.add_argument("--detailed_analysis", action="store_true",
-                       help="Run detailed performance analysis")
+                        help="Run detailed performance analysis")
     return parser.parse_args()
 
 def setup_experiment(cfg):
@@ -182,10 +191,11 @@ def main():
     if args.stage in ["1", "all"]:
         print("\n\n>>> STAGE 1: Knowledge Distillation <<<")
         
-        # COCO 데이터 다운로드
-        COCO_DIR = download_and_setup_data(cfg)
+        # COCO 및 KITTI 데이터 다운로드 및 설정
+        # (download_and_setup_data 함수가 이제 COCO와 KITTI 모두 처리함)
+        DATA_DIR = download_and_setup_data(cfg)
         
-        if COCO_DIR:
+        if DATA_DIR: # COCO_DIR가 반환됨
             # Transform (Augmentation 적용)
             if cfg.get('AUGMENTATION', {}).get('USE_ALBUMENTATIONS', False):
                 print("[Stage 1] Using Albumentations augmentation")
@@ -194,17 +204,50 @@ def main():
                 print("[Stage 1] Using basic CLIP transform")
                 train_transform = get_clip_transform(cfg['IMAGE_SIZE'])
             
-            # Dataset & Loader
-            train_dataset = COCORegionTextDataset(
-                COCO_DIR, cfg, transform=train_transform, 
-                max_images=cfg['MAX_IMAGES_TRAINING']
+            # 1. COCO Dataset
+            print("Loading COCO Dataset...")
+            coco_dataset = COCORegionTextDataset(
+                DATA_DIR, cfg, transform=train_transform, 
+                max_images=cfg.get('MAX_IMAGES_TRAINING')
             )
+            
+            # 2. KITTI/Talk2Car Dataset (Domain Specific)
+            # KITTI 경로 확인 (없으면 Talk2Car 사용)
+            kitti_dir = Path(cfg['ROOT_DIR']) / cfg.get('KITTI_DIR_NAME', 'kitti')
+            t2c_dir = Path(cfg['ROOT_DIR']) / cfg['TALK2CAR']['DIR_NAME']
+            
+            domain_dataset = None
+            if kitti_dir.exists():
+                print(f"Loading KITTI Dataset from {kitti_dir}...")
+                domain_dataset = KITTIRegionDataset(
+                    kitti_dir, cfg, split='training', transform=train_transform
+                )
+            # elif t2c_dir.exists():
+            #     print(f"Loading Talk2Car Dataset (Stage 1) from {t2c_dir}...")
+            #     domain_dataset = Talk2CarRegionDataset(
+            #         t2c_dir, cfg, transform=train_transform
+            #     )
+            
+            # 3. 데이터셋 병합 (ConcatDataset)
+            if domain_dataset and len(domain_dataset) > 0:
+                # [핵심] 도메인 데이터 비중 늘리기 (Oversampling x5 ~ x10)
+                oversample_ratio = cfg.get('DOMAIN_OVERSAMPLE_RATIO', 5)
+                mixed_dataset = ConcatDataset([coco_dataset] + [domain_dataset] * oversample_ratio)
+                print(f"✅ Mixed Dataset Created: COCO({len(coco_dataset)}) + Domain({len(domain_dataset)} x {oversample_ratio})")
+            else:
+                mixed_dataset = coco_dataset
+                print("⚠️ Domain dataset not found. Using COCO only.")
+
+            # DataLoader
             train_loader = torch.utils.data.DataLoader(
-                train_dataset, 
+                mixed_dataset, 
                 batch_size=cfg['TRAIN']['BATCH_SIZE'], 
                 shuffle=True, 
                 collate_fn=collate_fn, 
-                num_workers=cfg['TRAIN']['NUM_WORKERS']
+                num_workers=cfg['TRAIN']['NUM_WORKERS'],
+                pin_memory=True,
+                drop_last=True,
+                persistent_workers=True
             )
             
             # Loss & Optimizer
@@ -219,17 +262,17 @@ def main():
             print(f"\n[Stage 1] Training for {cfg['TRAIN']['NUM_EPOCHS']} epochs...")
             for epoch in range(1, cfg['TRAIN']['NUM_EPOCHS'] + 1):
                 train_epoch(student_encoder, loss_fn, optimizer, train_loader, 
-                           tokenizer, teacher_model, device, cfg, epoch)
+                            tokenizer, teacher_model, device, cfg, epoch)
             
             # Save
             torch.save({'state_dict': student_encoder.state_dict()}, save_student_path)
             print(f"\n[Stage 1] ✅ Model saved to {save_student_path}")
             
-            # Evaluate
-            print("\n[Stage 1] Evaluating retrieval performance...")
-            evaluate_retrieval(student_encoder, train_loader, tokenizer, teacher_model, device, cfg)
+            # Evaluate (Optional)
+            # print("\n[Stage 1] Evaluating retrieval performance...")
+            # evaluate_retrieval(student_encoder, train_loader, tokenizer, teacher_model, device, cfg)
         else:
-            print("[Stage 1] ❌ Error: Missing COCO data. Skipping Stage 1.")
+            print("[Stage 1] ❌ Error: Data setup failed. Skipping Stage 1.")
 
     # ==========================================================================
     # STAGE 2: Talk2Car Fine-tuning (Grounding)
@@ -277,16 +320,24 @@ def main():
             num_workers=cfg['TALK2CAR']['FINE_TUNE']['NUM_WORKERS']
         )
         
-        # 3. Loss & Optimizer
-        t2c_loss_fn = Talk2CarLoss().to(device)
+        # 3. Loss & Optimizer (CIoU 적용됨)
+        # config에 가중치가 있다면 사용, 없으면 기본값
+        l1_w = float(cfg['TALK2CAR']['FINE_TUNE']['LOSS_WEIGHTS'].get('w_l1', 5.0))
+        ciou_w = float(cfg['TALK2CAR']['FINE_TUNE']['LOSS_WEIGHTS'].get('w_giou', 2.0)) # 호환성 위해 giou 키 사용
+        
+        t2c_loss_fn = Talk2CarLoss(lambda_l1=l1_w, lambda_ciou=ciou_w).to(device)
+        
         ft_optimizer = optim.AdamW(
             talk2car_model.parameters(),
             lr=float(cfg['TALK2CAR']['FINE_TUNE']['LEARNING_RATE'])
         )
         
         # Scheduler
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            ft_optimizer, mode='max', factor=0.5, patience=3, verbose=True
+        scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            ft_optimizer, 
+            T_0=10,      # 10 epoch마다 재시작
+            T_mult=2,    # 재시작 주기 2배씩 증가
+            eta_min=1e-7
         )
         
         best_iou = 0.0
@@ -296,7 +347,7 @@ def main():
         for epoch in range(1, cfg['TALK2CAR']['FINE_TUNE']['NUM_EPOCHS'] + 1):
             # Train
             fine_tune_epoch(talk2car_model, t2c_loss_fn, ft_optimizer, train_loader, 
-                           tokenizer, teacher_model, device, epoch, cfg)
+                            tokenizer, teacher_model, device, epoch, cfg)
             
             # Evaluate
             avg_iou, ap50 = evaluate_talk2car(talk2car_model, val_loader, tokenizer, 
@@ -320,7 +371,7 @@ def main():
             detailed_talk2car_analysis(talk2car_model, val_loader, tokenizer, teacher_model, device)
 
     # ==========================================================================
-    # TEST INFERENCE MODE (NEW)
+    # TEST INFERENCE MODE
     # ==========================================================================
     if args.stage == "test" or args.generate_predictions:
         print("\n\n>>> TEST INFERENCE MODE <<<")
@@ -338,15 +389,17 @@ def main():
         print(f"[Test] Loading model from {best_model_path}")
         
         # 2. 모델 초기화
-        # Student Encoder 로드
-        student_weights_path = str(best_model_path).replace("talk2car_final.pth", "distilled_weights.pth")
-        if not Path(student_weights_path).exists():
-            student_weights_path = find_latest_checkpoint(cfg['ROOT_DIR'], "distilled_weights.pth")
-        
+        # Student Encoder 로드 (구조 동일해야 함)
         student_encoder = load_student_encoder(
-            str(student_weights_path) if student_weights_path else "",
+            "", # 가중치는 아래 load_state_dict에서 덮어씌워짐
             text_dim, cfg['STUDENT_MODEL_BACKBONE'], device
         )
+
+        try:
+            student_encoder = torch.compile(student_encoder)
+            print("[Info] Student Model compiled with torch.compile() 🚀")
+        except:
+            pass
         
         talk2car_model = Talk2CarModel(
             student_encoder, text_dim, 

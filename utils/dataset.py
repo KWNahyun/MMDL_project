@@ -5,6 +5,7 @@ from pycocotools.coco import COCO
 from PIL import Image
 from pathlib import Path
 import torch
+import numpy as np
 import os
 
 # CLIP 표준 정규화 상수
@@ -56,7 +57,7 @@ def get_augmented_transform(image_size, cfg):
     except ImportError:
         print("[Warning] Albumentations not installed. Using basic transform.")
         return get_clip_transform(image_size)
-
+    
 class COCORegionTextDataset(Dataset):
     def __init__(self, coco_dir, cfg, split="train2017", ann="instances_train2017.json", transform=None, max_images=None):
         
@@ -148,20 +149,189 @@ class COCORegionTextDataset(Dataset):
 
             text = f"{size} {cat}"
 
-            # 변환
-            crop = crop.resize((self.image_size, self.image_size))
-            t_img = self.transform(crop) if self.transform else T.ToTensor()(crop)
+            # -----------------------------------------------------------
+            # [수정됨] Transform 호환성 처리 (Albumentations vs Torchvision)
+            # -----------------------------------------------------------
+            # Resize는 공통적으로 적용하거나, Transform 내부에 포함되어 있다면 제거 가능
+            # 여기서는 Transform에 Resize가 포함되어 있으므로 crop.resize는 제거하거나 유지해도 됨.
+            # 하지만 Albumentations는 Numpy 배열을 원하므로 변환이 필요함.
+            
+            if self.transform:
+                try:
+                    # 1. Albumentations 시도
+                    # - Numpy 배열 변환
+                    # - image= 키워드 인자 사용
+                    crop_np = np.array(crop) 
+                    augmented = self.transform(image=crop_np)
+                    t_img = augmented['image']
+                except (TypeError, KeyError):
+                    # 2. Torchvision 시도 (기존 방식, PIL Image 사용)
+                    # 혹시 Albumentations가 아닌 경우를 대비
+                    crop_resized = crop.resize((self.image_size, self.image_size))
+                    t_img = self.transform(crop_resized)
+            else:
+                # Transform 없을 때 기본
+                crop_resized = crop.resize((self.image_size, self.image_size))
+                t_img = T.ToTensor()(crop_resized)
+            # -----------------------------------------------------------
 
             regions.append({"image": t_img, "text": text})
 
         return {"image_path": str(path), "regions": regions}
+    
 
 def collate_fn(batch):
-    """배치 병합"""
-    imgs,texts=[],[]
+    """
+    COCO(Dict)와 KITTI(Tuple) 데이터셋의 서로 다른 출력을
+    하나의 배치로 통합하는 함수
+    """
+    imgs = []
+    texts = []
+
     for b in batch:
-        for r in b["regions"]:
-            imgs.append(r["image"])
-            texts.append(r["text"])
-    if len(imgs)==0: return None
-    return torch.stack(imgs,0), texts
+        if b is None:
+            continue
+            
+        # Case 1: COCO 데이터셋 (Dictionary 형태)
+        # 구조: {'regions': [{'image': tensor, 'text': str}, ...]}
+        if isinstance(b, dict) and "regions" in b:
+            for r in b["regions"]:
+                imgs.append(r["image"])
+                texts.append(r["text"])
+        
+        # Case 2: KITTI/Talk2Car 데이터셋 (Tuple 형태)
+        # 구조: (img_tensor, text_str)
+        elif isinstance(b, (tuple, list)) and len(b) == 2:
+            img, text = b
+            imgs.append(img)
+            texts.append(text)
+            
+    # 데이터가 없으면 None 반환 (DataLoader에서 처리)
+    if len(imgs) == 0:
+        return None
+
+    # 최종 텐서 스택 및 리스트 반환
+    return torch.stack(imgs, 0), texts
+
+class KITTIRegionDataset(Dataset):
+    """
+    Stage 1용 KITTI 데이터셋 로더 (Object Detection)
+    - 역할: KITTI의 txt 라벨을 파싱하여 객체를 잘라냄(Crop)
+    - 특징: 'Car', 'Pedestrian', 'Cyclist' 등 자율주행 핵심 객체 학습
+    """
+    def __init__(self, data_dir, cfg, split='training', transform=None):
+        self.data_dir = Path(data_dir)
+        self.img_dir = self.data_dir / split / "image_2"
+        self.label_dir = self.data_dir / split / "label_2"
+        self.transform = transform
+        self.image_size = cfg['IMAGE_SIZE']
+        
+        # 데이터 미리 파싱 (모든 객체를 리스트로 만듦)
+        self.samples = []
+        self._parse_kitti_labels()
+        
+        print(f"[Init] KITTIRegionDataset (Stage 1 Mix) | {len(self.samples)} objects loaded.")
+
+    def _parse_kitti_labels(self):
+        """KITTI 라벨 파일(.txt)을 읽어서 개별 객체 단위로 저장"""
+        if not self.label_dir.exists():
+            print(f"[Error] Label dir not found: {self.label_dir}")
+            return
+
+        label_files = sorted(list(self.label_dir.glob("*.txt")))
+        
+        for lf in label_files:
+            img_id = lf.stem  # 파일명 (예: 000001)
+            img_path = self.img_dir / f"{img_id}.png" # KITTI는 보통 png
+            
+            if not img_path.exists():
+                img_path = self.img_dir / f"{img_id}.jpg" # jpg인 경우 대비
+                if not img_path.exists(): continue
+
+            with open(lf, 'r') as f:
+                lines = f.readlines()
+                
+            for line in lines:
+                parts = line.strip().split(' ')
+                obj_class = parts[0] # Car, Pedestrian, etc.
+                
+                # DontCare나 Misc는 제외
+                if obj_class in ['DontCare', 'Misc']:
+                    continue
+                
+                # BBox 좌표 (Left, Top, Right, Bottom) - float 형임
+                # KITTI Format: type truncated occluded alpha x1 y1 x2 y2 ...
+                try:
+                    x1 = float(parts[4])
+                    y1 = float(parts[5])
+                    x2 = float(parts[6])
+                    y2 = float(parts[7])
+                    
+                    self.samples.append({
+                        'img_path': img_path,
+                        'bbox': (x1, y1, x2, y2),
+                        'class': obj_class
+                    })
+                except:
+                    continue
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        item = self.samples[idx]
+        
+        # 1. 이미지 로드
+        try:
+            img = Image.open(item['img_path']).convert('RGB')
+        except:
+            return self.__getitem__((idx + 1) % len(self.samples))
+
+        W, H = img.size
+        
+        # 2. BBox Crop
+        x1, y1, x2, y2 = item['bbox']
+        
+        # 좌표 정수 변환 및 클리핑
+        left = max(0, int(x1))
+        top = max(0, int(y1))
+        right = min(W, int(x2))
+        bottom = min(H, int(y2))
+        
+        if right <= left or bottom <= top:
+            return self.__getitem__((idx + 1) % len(self.samples))
+
+        crop_img = img.crop((left, top, right, bottom))
+
+        # 3. 텍스트 생성 (Size + Class)
+        # 예: "a small Car", "a large Pedestrian"
+        obj_class = item['class']
+        
+        # 객체 면적 비율 계산
+        area_ratio = ((right - left) * (bottom - top)) / (W * H)
+        
+        if area_ratio < 0.005: size_text = "a very small"
+        elif area_ratio < 0.02: size_text = "a small"
+        elif area_ratio < 0.08: size_text = "a medium"
+        else: size_text = "a large"
+        
+        text = f"{size_text} {obj_class}"
+
+        # 4. Transform
+        if self.transform:
+            try:
+                # Albumentations
+                import numpy as np
+                crop_np = np.array(crop_img)
+                augmented = self.transform(image=crop_np)
+                img_tensor = augmented['image']
+            except:
+                # Torchvision
+                img_tensor = self.transform(crop_img)
+        else:
+            img_tensor = T.Compose([
+                T.Resize((self.image_size, self.image_size)),
+                T.ToTensor()
+            ])(crop_img)
+
+        return img_tensor, text

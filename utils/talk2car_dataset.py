@@ -5,6 +5,7 @@ import torch
 import torch.utils.data as data
 from PIL import Image
 from pathlib import Path
+import numpy as np
 
 def get_talk2car_augmentation(image_size, cfg):
     """
@@ -161,40 +162,47 @@ class Talk2CarDataset(data.Dataset):
         bbox = item['2d_box']
         x, y, w, h = bbox
         
-        # Albumentations 사용 시
-        if hasattr(self.transform, 'processors'):
-            try:
-                transformed = self.transform(image=np.array(img), bboxes=[[x, y, w, h]])
-                img_tensor = transformed['image']
-                
-                # BBox 정규화 (Transform 후)
-                if len(transformed['bboxes']) > 0:
-                    tx, ty, tw, th = transformed['bboxes'][0]
-                    norm_bbox = torch.tensor([
-                        tx / self.cfg['IMAGE_SIZE'],
-                        ty / self.cfg['IMAGE_SIZE'],
-                        tw / self.cfg['IMAGE_SIZE'],
-                        th / self.cfg['IMAGE_SIZE']
-                    ], dtype=torch.float32)
-                else:
-                    # BBox가 사라진 경우 원본 사용
-                    norm_bbox = torch.tensor([
-                        x / w_orig, y / h_orig, w / w_orig, h / h_orig
-                    ], dtype=torch.float32)
-            except:
-                # Albumentations 실패 시 기본 방식
-                img_tensor = self.transform(img)
+        # -----------------------------------------------------------
+        # [수정됨] Transform 호환성 처리 (Albumentations vs Torchvision)
+        # -----------------------------------------------------------
+        try:
+            # 1. Albumentations 시도 (학습용)
+            # - numpy 배열로 변환 필요
+            # - image=, bboxes= 키워드 인자 필요
+            # - 결과가 딕셔너리로 반환됨
+            img_np = np.array(img)
+            transformed = self.transform(image=img_np, bboxes=[[x, y, w, h]])
+            img_tensor = transformed['image']
+            
+            # Augmentation으로 변형된 BBox 좌표 계산
+            if len(transformed['bboxes']) > 0:
+                tx, ty, tw, th = transformed['bboxes'][0]
+                norm_bbox = torch.tensor([
+                    tx / self.cfg['IMAGE_SIZE'],
+                    ty / self.cfg['IMAGE_SIZE'],
+                    tw / self.cfg['IMAGE_SIZE'],
+                    th / self.cfg['IMAGE_SIZE']
+                ], dtype=torch.float32)
+            else:
+                # Augmentation 중 BBox가 잘려나간 경우 (예: Crop) -> 원본 좌표 사용
                 norm_bbox = torch.tensor([
                     x / w_orig, y / h_orig, w / w_orig, h / h_orig
                 ], dtype=torch.float32)
-        else:
-            # 기본 Transform
+
+        except (TypeError, KeyError):
+            # 2. Torchvision 시도 (검증/테스트용)
+            # - PIL Image를 직접 받음 (numpy 변환 불필요)
+            # - 키워드 인자(image=) 사용 불가
+            # - 텐서를 바로 반환
             img_tensor = self.transform(img)
+            
+            # 좌표는 원본 비율대로 정규화
             norm_bbox = torch.tensor([
                 x / w_orig, y / h_orig, w / w_orig, h / h_orig
             ], dtype=torch.float32)
-        
-        # 범위 클램핑
+        # -----------------------------------------------------------
+
+        # 범위 클램핑 (0.0 ~ 1.0)
         norm_bbox = torch.clamp(norm_bbox, 0.0, 1.0)
 
         # 명령어 및 토큰

@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import math
 
 class DistillationLosses(nn.Module):
     """
@@ -69,76 +70,129 @@ class DistillationLosses(nn.Module):
         return L_total, L_clip, L_cos, L_sim
 
 
+class CIoULoss(nn.Module):
+    """
+    Complete IoU Loss
+    기존 GIoU보다 수렴이 빠르고 정확하며, Aspect Ratio(종횡비)를 고려하여
+    작은 객체의 형태를 더 잘 잡아냅니다.
+    """
+    def __init__(self, eps=1e-7):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, pred_boxes, target_boxes):
+        """
+        Args:
+            pred_boxes: [B, 4] (x_top_left, y_top_left, w, h)
+            target_boxes: [B, 4] (x_top_left, y_top_left, w, h)
+        """
+        # 1. 좌표 변환: (x, y, w, h) -> (x1, y1, x2, y2)
+        b1_x1, b1_y1 = pred_boxes[:, 0], pred_boxes[:, 1]
+        b1_w, b1_h = pred_boxes[:, 2], pred_boxes[:, 3]
+        b1_x2, b1_y2 = b1_x1 + b1_w, b1_y1 + b1_h
+
+        b2_x1, b2_y1 = target_boxes[:, 0], target_boxes[:, 1]
+        b2_w, b2_h = target_boxes[:, 2], target_boxes[:, 3]
+        b2_x2, b2_y2 = b2_x1 + b2_w, b2_y1 + b2_h
+
+        # 2. Intersection
+        inter_x1 = torch.max(b1_x1, b2_x1)
+        inter_y1 = torch.max(b1_y1, b2_y1)
+        inter_x2 = torch.min(b1_x2, b2_x2)
+        inter_y2 = torch.min(b1_y2, b2_y2)
+
+        inter_w = torch.clamp(inter_x2 - inter_x1, min=0)
+        inter_h = torch.clamp(inter_y2 - inter_y1, min=0)
+        inter_area = inter_w * inter_h
+
+        # 3. Union
+        w1, h1 = b1_w, b1_h
+        w2, h2 = b2_w, b2_h
+        union_area = w1 * h1 + w2 * h2 - inter_area + self.eps
+
+        # 4. IoU
+        iou = inter_area / union_area
+
+        # 5. Enclosing Box (최소 외접 사각형)의 대각선 길이 (c^2)
+        cw = torch.max(b1_x2, b2_x2) - torch.min(b1_x1, b2_x1)
+        ch = torch.max(b1_y2, b2_y2) - torch.min(b1_y1, b2_y1)
+        c2 = cw ** 2 + ch ** 2 + self.eps
+
+        # 6. 중심점 거리 (rho^2)
+        b1_cx, b1_cy = b1_x1 + w1 / 2, b1_y1 + h1 / 2
+        b2_cx, b2_cy = b2_x1 + w2 / 2, b2_y1 + h2 / 2
+        rho2 = (b1_cx - b2_cx) ** 2 + (b1_cy - b2_cy) ** 2
+
+        # 7. Aspect Ratio 보정 (v)
+        v = (4 / (math.pi ** 2)) * torch.pow(torch.atan(w2 / (h2 + self.eps)) - torch.atan(w1 / (h1 + self.eps)), 2)
+
+        # 8. Alpha
+        with torch.no_grad():
+            alpha = v / (1 - iou + v + self.eps)
+
+        # 9. CIoU Loss
+        ciou = iou - (rho2 / c2) - alpha * v
+        loss = 1.0 - ciou
+
+        return loss.mean()
+
+
 class Talk2CarLoss(nn.Module):
     """
     Stage 2 Fine-tuning Loss
-    L1 + GIoU
+    L1 + CIoU (Updated from GIoU)
     """
-    def __init__(self):
+    def __init__(self, lambda_l1=5.0, lambda_ciou=2.0):
         super().__init__()
-
-    def box_cxcywh_to_xyxy(self, x):
-        x_c, y_c, w, h = x.unbind(-1)
-        b = [(x_c), (y_c), (x_c + w), (y_c + h)]
-        return torch.stack(b, dim=-1)
-
-    def generalized_box_iou(self, boxes1, boxes2):
-        # Intersection
-        lt = torch.max(boxes1[:, :2], boxes2[:, :2])
-        rb = torch.min(boxes1[:, 2:], boxes2[:, 2:])
-        wh = (rb - lt).clamp(min=0)
-        inter = wh[:, 0] * wh[:, 1]
-
-        # Union
-        area1 = (boxes1[:, 2] - boxes1[:, 0]) * (boxes1[:, 3] - boxes1[:, 1])
-        area2 = (boxes2[:, 2] - boxes2[:, 0]) * (boxes2[:, 3] - boxes2[:, 1])
-        union = area1 + area2 - inter
-
-        # IoU
-        iou = inter / (union + 1e-6)
-
-        # Enclosing Box
-        lt_c = torch.min(boxes1[:, :2], boxes2[:, :2])
-        rb_c = torch.max(boxes1[:, 2:], boxes2[:, 2:])
-        wh_c = (rb_c - lt_c).clamp(min=0)
-        area_c = wh_c[:, 0] * wh_c[:, 1]
-
-        # GIoU
-        giou = iou - ((area_c - union) / (area_c + 1e-6))
-        return giou
-
-    def forward(self, pred_bbox, gt_bbox, weights):
-        # L1 Loss
-        loss_l1 = F.l1_loss(pred_bbox, gt_bbox, reduction='mean')
-
-        # GIoU Loss
-        pred_xyxy = self.box_cxcywh_to_xyxy(pred_bbox)
-        gt_xyxy = self.box_cxcywh_to_xyxy(gt_bbox)
+        self.l1_loss = nn.L1Loss(reduction='mean')
+        self.ciou_loss = CIoULoss()
         
-        giou = self.generalized_box_iou(pred_xyxy, gt_xyxy)
-        loss_giou = 1.0 - giou.mean()
+        # 기본 가중치 (외부에서 weights 딕셔너리가 오지 않을 경우 사용)
+        self.default_l1_w = lambda_l1
+        self.default_ciou_w = lambda_ciou
 
-        loss_total = (weights['w_l1'] * loss_l1) + (weights['w_giou'] * loss_giou)
+    def forward(self, pred_bbox, gt_bbox, weights=None):
+        """
+        Args:
+            pred_bbox: [B, 4] normalized (x, y, w, h)
+            gt_bbox: [B, 4] normalized (x, y, w, h)
+            weights: dict, optional (e.g. {'w_l1': 5.0, 'w_giou': 2.0})
+                     * 호환성을 위해 키값이 'w_giou'여도 내부적으로 CIoU 가중치로 씁니다.
+        """
+        # 1. L1 Loss
+        loss_l1 = self.l1_loss(pred_bbox, gt_bbox)
+
+        # 2. CIoU Loss
+        loss_ciou = self.ciou_loss(pred_bbox, gt_bbox)
+
+        # 3. 가중치 적용
+        w_l1 = self.default_l1_w
+        w_ciou = self.default_ciou_w
         
-        return loss_total, loss_l1, loss_giou
+        if weights is not None:
+            w_l1 = weights.get('w_l1', w_l1)
+            # 기존 코드와의 호환성을 위해 'w_giou' 키가 있으면 그걸 CIoU 가중치로 사용
+            if 'w_giou' in weights:
+                w_ciou = weights['w_giou']
+            elif 'w_ciou' in weights:
+                w_ciou = weights['w_ciou']
+
+        loss_total = (w_l1 * loss_l1) + (w_ciou * loss_ciou)
+        
+        return loss_total, loss_l1, loss_ciou
 
 
 class FocalLoss(nn.Module):
     """
-    Focal Loss for imbalanced data (팀원 코드 반영)
+    Focal Loss for imbalanced data
     Talk2Car에서 특정 명령어가 과도하게 많을 때 사용
     """
     def __init__(self, alpha=None, gamma=2.0):
         super().__init__()
-        self.alpha = alpha  # 클래스별 가중치 [num_classes]
-        self.gamma = gamma  # Hard example focusing
+        self.alpha = alpha
+        self.gamma = gamma
         
     def forward(self, inputs, targets):
-        """
-        Args:
-            inputs: [B, num_classes] logits
-            targets: [B] class indices
-        """
         ce_loss = F.cross_entropy(inputs, targets, reduction='none', weight=self.alpha)
         pt = torch.exp(-ce_loss)
         focal_loss = ((1 - pt) ** self.gamma) * ce_loss
