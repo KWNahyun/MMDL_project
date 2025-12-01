@@ -110,7 +110,8 @@ class DistilledConvNeXtTinyMultiScale(nn.Module):
         dims = self.backbone.feature_info.channels() # [96, 192, 384, 768]
         
         # 각 스케일별 투영 레이어 (모두 256 채널로 통일)
-        self.proj_c0 = nn.Conv2d(dims[0], 256, kernel_size=3, padding=1, stride=2) # Stride 4 -> 8 (Downsample)
+        # self.proj_c0 = nn.Conv2d(dims[0], 256, kernel_size=3, padding=1, stride=2) # Stride 4 -> 8 (Downsample)
+        self.proj_c0 = nn.Conv2d(dims[0], 256, kernel_size=1)
         self.proj_c1 = nn.Conv2d(dims[1], 256, kernel_size=1)                      # Stride 8 -> 8 (Keep)
         self.proj_c2 = nn.Conv2d(dims[2], 256, kernel_size=1)                      # Stride 16 -> 8 (Upsample)
         self.proj_c3 = nn.Conv2d(dims[3], 256, kernel_size=1)                      # Stride 32 -> 8 (Upsample)
@@ -132,21 +133,22 @@ class DistilledConvNeXtTinyMultiScale(nn.Module):
     def _get_fused_features(self, x):
         # c0: 1/4, c1: 1/8, c2: 1/16, c3: 1/32
         c0, c1, c2, c3 = self.backbone(x)
-        
-        # 1. 모든 피처를 Stride 8 (c1 크기)로 맞춤
-        # c0 (Stride 4) -> Convolution으로 줄임 (정보 압축)
+
+        # [수정] 기준 해상도를 가장 큰 c0 (Stride 4)로 설정
+        h, w = c0.shape[-2:] 
+
+        # 1. 모든 피처를 256 채널로 변환
+        # c0: Stride 4 유지 (가장 선명한 정보)
         f0 = self.proj_c0(c0) 
-        
-        # c1 (Stride 8) -> 그대로
-        f1 = self.proj_c1(c1)
-        
-        # c2, c3 -> Interpolation으로 늘림
-        h, w = c1.shape[-2:]
+
+        # c1, c2, c3: 모두 c0 크기(h, w)로 확대 (Upsample)
+        f1 = F.interpolate(self.proj_c1(c1), size=(h, w), mode='bilinear', align_corners=False)
         f2 = F.interpolate(self.proj_c2(c2), size=(h, w), mode='bilinear', align_corners=False)
         f3 = F.interpolate(self.proj_c3(c3), size=(h, w), mode='bilinear', align_corners=False)
         
-        # 2. Concat
+        # 2. 합치기 (Concat)
         x_feat = torch.cat([f0, f1, f2, f3], dim=1) # [B, 1024, H, W]
+
 
         # [수정 3] Coordinate Channel 추가 (CoordConv)
         # 모델이 "여기가 왼쪽 위다, 오른쪽 아래다"를 명시적으로 알게 해줌

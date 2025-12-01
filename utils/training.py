@@ -145,43 +145,45 @@ def adapt_teacher_to_talk2car(teacher_model, tokenizer, t2c_dir, device, cfg):
     
     return teacher_model
 
-# ==============================================================================
-# Stage 1: Knowledge Distillation
-# ==============================================================================
 
-# train_epoch 함수 수정
 def train_epoch(student_encoder, clip_loss_fn, optimizer, loader, tokenizer, teacher_model, device, cfg, epoch):
     student_encoder.train()
     clip_loss_fn.train()
     
-    # [NEW] Scaler 초기화
+    # Scaler 초기화
     scaler = GradScaler()
     
     s, acc = 0, 0
     weights = cfg['TRAIN']['LOSS_WEIGHTS']
     
+    # [NEW] 그래디언트 누적 스텝 설정 (Config에 없으면 기본값 4 사용)
+    # 배치 사이즈를 1/4로 줄였으면 accumulation_steps=4로 설정하여 원래 효과 유지
+    accumulation_steps = cfg['TRAIN'].get('ACCUMULATION_STEPS', 4)
+    
     pbar = tqdm(loader, desc=f"Ep {epoch}")
+
+    # [수정 1] 루프 시작 전에 그래디언트 초기화
+    optimizer.zero_grad()
 
     for step, bt in enumerate(pbar):
         if bt is None: continue
         images, texts = bt
         images = images.to(device)
 
-        # 1. Teacher (FP16으로 실행 권장 - 원래 CLIP은 FP16 학습됨)
+        # 1. Teacher (FP16 Context)
         with torch.no_grad():
-            with autocast(): # Teacher도 가볍게
+            with autocast():
                 txt_emb_teacher = encode_text(texts, tokenizer, teacher_model, device)
                 img_emb_teacher = encode_image_teacher(images, teacher_model)
                 
-                # Normalize
                 t_img_norm = F.normalize(img_emb_teacher, dim=-1)
                 t_txt_norm = F.normalize(txt_emb_teacher, dim=-1)
                 logits_teacher = t_img_norm @ t_txt_norm.t()
 
-        # 2. Student 학습 (Mixed Precision 적용)
-        optimizer.zero_grad()
+        # 2. Student 학습
+        # [삭제] optimizer.zero_grad() -> 여기서 매번 초기화하면 안 됨 (누적해야 하므로)
         
-        with autocast(): # [핵심] 연산을 FP16으로 수행
+        with autocast():
             img_emb_student = student_encoder(images)
             
             L_total, L_clip, L_cos, L_sim = clip_loss_fn(
@@ -191,19 +193,33 @@ def train_epoch(student_encoder, clip_loss_fn, optimizer, loader, tokenizer, tea
                 logits_teacher=logits_teacher,
                 weights=weights
             )
+            
+            # [수정 2] Loss를 누적 스텝 수로 나누기 (평균을 맞추기 위함)
+            L_total = L_total / accumulation_steps
 
-        # 3. Scaler로 역전파 (Gradient Scaling)
+        # 3. Backward (Scale)
         scaler.scale(L_total).backward()
-        scaler.step(optimizer)
-        scaler.update()
 
-        acc += L_total.item()
+        # [수정 3] 정해진 스텝마다 파라미터 업데이트 (Accumulation)
+        if (step + 1) % accumulation_steps == 0:
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad() # 업데이트 후에 초기화
+
+        # 로깅 (나눴던 값을 다시 곱해서 원래 스케일로 표시)
+        current_loss = L_total.item() * accumulation_steps
+        acc += current_loss
         s += 1
         
         pbar.set_postfix({'Loss': f"{acc/s:.4f}"})
+        
+    # 남은 그래디언트 처리 (선택 사항: 루프가 끝났는데 업데이트 안 된 게 있으면 처리)
+    if (step + 1) % accumulation_steps != 0:
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad()
 
     return acc / s if s > 0 else 0
-
 # ==============================================================================
 # Stage 2: Talk2Car Fine-tuning
 # ==============================================================================

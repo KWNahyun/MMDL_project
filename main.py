@@ -35,15 +35,21 @@ warnings.filterwarnings('ignore')
 
 # === Logging Helper ===
 class Logger(object):
-    """콘솔 출력을 파일과 터미널에 동시 출력"""
-    def __init__(self, filename, stream): # stream 인자 추가 (stdout 또는 stderr)
+    """콘솔 출력을 파일과 터미널에 동시 출력 (파일에는 진행바 갱신 제외)"""
+    def __init__(self, filename, stream):
         self.terminal = stream
         self.log = open(filename, "a", encoding='utf-8')
 
     def write(self, message):
+        # 1. 터미널에는 모든 메시지 출력 (진행바 애니메이션 유지)
         self.terminal.write(message)
-        self.log.write(message)
-        self.log.flush() # 즉시 파일에 쓰기
+        self.terminal.flush()
+
+        # 2. 파일에는 '\r' (캐리지 리턴)이 없는 메시지만 기록
+        # '\r'은 진행바가 제자리에서 갱신될 때 쓰는 문자입니다.
+        if '\r' not in message:
+            self.log.write(message)
+            self.log.flush()
 
     def flush(self):
         self.terminal.flush()
